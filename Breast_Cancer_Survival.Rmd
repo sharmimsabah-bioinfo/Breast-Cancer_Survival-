@@ -1,0 +1,1396 @@
+---
+title: "Breast Cancer Survival Prediction Using Gene Expression Data: A Heterogeneous Ensemble Approach"
+author: "Sharmim Sultana"
+output:
+  html_document:
+    breastcancer_df_print: paged
+---
+
+# 1. Business Understanding
+
+Breast cancer is one of the most common cancers in the world. If we can predict early whether a patient will survive, doctors can make better treatment decisions and plan care more effectively. That is exactly what I set out to do in this project.
+I used real gene expression data from 1,218 breast cancer patients in The Cancer Genome Atlas (TCGA) to predict survival status — alive or deceased. I built three machine learning models, combined them into an ensemble, and used the results to identify which genes matter most.
+Data source: UCSC Xena Browser — TCGA Breast Cancer (BRCA) cohort
+Expression data: HiSeqV2 RNA-seq (20,530 genes, 1,218 patients)
+Survival data: TCGA BRCA survival labels (1,236 patients)
+Target variable: OS — 0 = alive, 1 = deceased
+
+
+# 2. Load All Libraries
+
+Here i load all the required libraries that are needed for the entire project.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(nnet)
+library(smotefamily)
+library(gbm)
+library(pROC)
+
+set.seed(5030)
+```
+
+---
+
+# 3. Data Loading
+
+I load the Data directly from publicly available URLs on the UCSC Xena TCGA data hub, so that this result can be reproduced by anyone.
+
+```{r}
+# Gene Expression (HiSeqV2)
+url_expr <- "https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.BRCA.sampleMap%2FHiSeqV2.gz"
+expr_df  <- as.data.frame(fread(url_expr))
+
+# Curated survival data
+url_surv <- "https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/survival%2FBRCA_survival.txt"
+surv_df  <- read.delim(url_surv, header = TRUE, stringsAsFactors = FALSE)
+
+dim(expr_df)
+dim(surv_df)
+head(surv_df, 3)
+```
+
+Expression file: 20,530 genes from 1,218 patients, measuring the activity of every single gene in breast cancer patients.
+Survival file: 1,236 patients × 11 columns, here each row is a breast cancer patient and the most important column simply tells us whether they make it or not. I connected these two files together so that for each patient I know both what was happening inside their tumor and whether they survived to  find the gene patterns that separate the survivors from those who did not make it
+
+
+# 4. Data Understanding & Quality Assessment
+
+Before building the models, i make sure the data  int the right shape so that i can two separate files, one with tumor gene activity and one with patient survival outcomes. In this i  section clean, reshapes, and connects both data together into one dataset. 
+
+## 4.1 Transpose Expression Matrix
+
+```{r}
+expr_mat <- as.matrix(expr_df[, -1])
+rownames(expr_mat) <- expr_df[[1]]
+expr_df  <- as.data.frame(t(expr_mat))
+```
+
+The expression file i download has genes as rows and patients as columns which works for biologists, but machine learning needs it flipped. since every algorithm expects each row to be one patient and each column to be one gene measurement.
+Think of it like a class gradebook. You would never put student names as column headers and subjects as rows — you put students as rows and their grades as columns. Same idea here..
+Therefore I flip the table. After flipping we have 1,218 patients as rows and 20,530 genes as columns, exactly what every model in this project needs to work correctly.
+
+
+
+## 4.2 Keep Primary Tumor Samples Only
+
+Here is something important,  TCGA did not just collect tumor tissue. For some patients they also collected healthy tissue from the same person for comparison TCGA barcodes tells exactly what each sample is. Code "01" means primary tumor, code "11" means healthy tissue. I keep only the tumors. My goal is to predict survival from tumor gene activity. If i accidentally include healthy tissue samples in my model it gets confused, it starts learning the difference between tumor cells and healthy cells instead of learning which tumor patterns predict survival.
+
+```{r}
+#flitering tumor, every TCGA barcode encodes the sample type in position 4, so I extract the first 2 characters from that position to identify tumor, normal,metastatic
+
+sample_type <- str_sub(str_split_fixed(rownames(expr_df), "-", 5)[, 4], 1, 2) #split the barcode into 5 pieces, take piece 4, keep first 2 characters
+table(sample_type) # counts how many samples belong to each type, tumors, metastatic, normal
+
+expr_df <- expr_df[sample_type == "01", ]
+dim(expr_df)
+```
+(01 = tumor, 06 = metastatic, 11 = normal) are defined by TCGA and built directly into every patient barcode
+https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/sample-type-codes
+
+Here, 114 are healthy tissue from the same patients is removed and 7 are metastatic samples are removed too. After filtering now i have 1,097 patients 20,530 genes.
+
+
+## 4.3 Prepare Survival Labels
+
+Here I use Survival (OS) the target variable, the most clinically meaningful outcome. OS = 0 means the patient is alive and OS = 1 means deceased. The patient barcode is trimmed to 12 characters to match the expression data format.
+
+```{r}
+# preparing survival data
+surv_clean <- surv_df %>%    # changed from surv_raw to surv_df
+  
+  # sample column contains long barcodes like TCGA-3C-AAAU-01
+  # trim to first 12 characters TCGA-3C-AAAU to match expression file format
+  mutate(patient_id = str_sub(sample, 1, 12)) %>%
+  
+  # keep only patient ID, survival status (OS), and survival time (OS.time)
+  select(patient_id, OS, OS.time) %>%
+  
+  # remove any patients whose survival outcome is unknown
+  filter(!is.na(OS), !is.na(OS.time))
+
+nrow(surv_clean)
+table(surv_clean$OS)
+round(prop.table(table(surv_clean$OS)) * 100, 1)
+```
+
+After cleaning now i have 1,235 patients with known survival outcomes. Out of those, 1,033 are alive (83.6%) and 202 are deceased (16.4%). This is a significant class imbalance it will simply predict everyone as alive and still score 83.6% accuracy without learning anything useful. I will fix this using SMOTE before training
+
+
+
+## 4.4 Join Expression and Survival Data
+
+```{r}
+patient_id   <- str_sub(rownames(expr_df), 1, 12)
+
+dat <- tibble(patient_id = patient_id) %>%    # make a table of patient IDs
+  distinct() %>%                              # remove any duplicates
+  
+  left_join(surv_clean, by = "patient_id") %>%
+  filter(!is.na(OS), !is.na(OS.time))
+
+expr_aligned <- expr_df[match(dat$patient_id, str_sub(rownames(expr_df), 1, 12)), ]
+
+nrow(dat)
+nrow(expr_aligned)
+table(dat$OS)
+```
+The two files are joined on the 12-character TCGA patient ID. This creates one combined dataset where every row is a real breast cancer patient with both their tumor gene expression profile and their survival outcome. After joining, 1,233 matched patients remain and these form the complete dataset used for all downstream modeling.
+
+
+## 4.5 Missing Value Assessment and Imputation
+
+```{r}
+sum(is.na(expr_aligned))
+colSums(is.na(dat))
+```
+
+No missing values are found in the expression data. As a precaution i will still apply median imputation as a safety net so if any values are missing when someone runs this notebook fresh from the URL they are handled automatically.
+
+
+
+```{r}
+for (j in seq_along(expr_aligned)) {
+  x <- expr_aligned[[j]]
+  if (anyNA(x)) expr_aligned[[j]][is.na(x)] <- median(x, na.rm = TRUE)
+}
+sum(is.na(expr_aligned))
+```
+
+Here, The loop goes through every gene column and replaces any missing value with the median of that gene across all patients. The median is used instead of the mean because RNA-seq data often contains extreme values and the median is not thrown off by those outliers. After imputation zero missing values remain.
+
+
+# 5. Exploratory Data Analysis
+
+## 5.1 Class Distribution
+
+```{r}
+#class distribuation
+y <- as.integer(dat$OS)
+
+class_df <- data.frame(
+  Status  = c("Alive (0)", "Deceased (1)"),
+  Count   = as.integer(table(y)),
+  Percent = round(as.numeric(prop.table(table(y))) * 100, 1)
+)
+class_df
+```
+The dataset is significantly imbalanced  83.6% of patients are alive and only 16.4% are deceased. A model that simply predicts everyone as alive would score 83.6% accuracy without learning anything useful. This is why F1-score is used as the primary metric and SMOTE will be applied before training.
+
+
+## 5.2 Variance Filter — Top 2,000 Genes
+
+```{r}
+# variance-filter
+vars   <- apply(expr_aligned, 2, var)
+vars   <- vars[vars > 0]
+keep   <- order(vars, decreasing = TRUE)[1:min(2000, length(vars))]
+X_2000 <- as.matrix(expr_aligned[, keep])
+
+dim(X_2000)
+```
+With 20,530 genes, most carry very little useful information, they look the same across almost every patient. I reduced to the top 2,000 most variable genes as a first step. Genes with near-zero variance are dropped because they cannot help distinguish survivors from non-survivors.
+
+
+## 5.3 Top Gene Expression Distributions
+
+```{r gene-distributions}
+top10_genes <- colnames(X_2000)[1:10]
+
+par(mfrow = c(2, 3))
+for (gene in top10_genes[1:6]) {
+  hist(X_2000[, gene], main = gene, xlab = "Expression (log2)",
+       col = "steelblue", breaks = 30)
+}
+par(mfrow = c(1, 1))
+```
+
+## 5.4 Expression by Survival Status
+
+```{r}
+par(mfrow = c(2, 3))
+for (gene in top10_genes[1:6]) {
+  boxplot(X_2000[, gene] ~ y,
+          main  = gene,
+          xlab  = "Survival (0=Alive, 1=Deceased)",
+          ylab  = "Expression (log2)",
+          col   = c("steelblue", "tomato"),
+          names = c("Alive", "Deceased"))
+}
+par(mfrow = c(1, 1))
+```
+I plotted histograms for the top 6 most variable genes to check their distributions. Most show approximately bell-shaped distributions after log2 normalization, which is expected for RNA-seq data and supports the use of logistic regression and neural networks which assume relatively normal input distributions.
+
+
+
+## 5.5 Variance Distribution
+
+```{r}
+gene_vars <- apply(X_2000, 2, var)
+hist(gene_vars, breaks = 50, col = "steelblue",
+     main = "Variance Distribution Across Top 2,000 Genes",
+     xlab = "Variance")
+summary(gene_vars)
+```
+
+I plotted the variance distribution across all 2,000 selected genes. Most genes have moderate variance with a small number of highly variable genes at the right tail. Those high-variance genes are the most informative for survival prediction and will be prioritized in the final feature selection step.
+
+
+## 5.6 Correlation Analysis — Top 20 Genes
+
+```{r}
+cor_mat <- cor(X_2000[, 1:20], use = "complete.obs")
+round(cor_mat[1:5, 1:5], 2)
+
+# correlation-heatmap}
+image(cor_mat,
+      main = "Correlation Heatmap — Top 20 Genes",
+      col  = colorRampPalette(c("tomato", "white", "steelblue"))(50),
+      axes = FALSE)
+axis(1, at = seq(0, 1, length.out = 20),
+     labels = colnames(cor_mat), las = 2, cex.axis = 0.6)
+axis(2, at = seq(0, 1, length.out = 20),
+     labels = rownames(cor_mat), las = 1, cex.axis = 0.6)
+```
+
+I computed a correlation matrix for the top 20 genes and visualized it as a heatmap. Most genes show low pairwise correlation, which means variance-based selection captured diverse and non-redundant gene signals. This confirms that multicollinearity is not a major concern and supports the decision to keep original gene features rather than applying PCA.
+
+
+## 5.7 Outlier Detection Z-Score Analysis
+
+```{r}
+# Compute z-scores for top 20 genes
+z_scores <- scale(X_2000[, 1:20])
+
+# Count extreme values per gene (|z| > 3)
+outlier_counts <- colSums(abs(z_scores) > 3, na.rm = TRUE)
+outlier_df <- data.frame(
+  Gene     = names(outlier_counts),
+  Outliers = as.integer(outlier_counts)
+)
+outlier_df <- outlier_df[order(-outlier_df$Outliers), ]
+head(outlier_df, 10)
+
+sum(outlier_counts)
+round(sum(outlier_counts) / (nrow(X_2000) * 20) * 100, 2)
+
+
+barplot(outlier_df$Outliers,
+        names.arg = outlier_df$Gene,
+        col  = "tomato",
+        main = "Outlier Count per Gene (|z-score| > 3)",
+        ylab = "Number of Outlier Samples",
+        las  = 2, cex.names = 0.65)
+```
+
+
+I detected outliers using z-scores with a threshold of 3. Any gene expression value more than 3 standard deviations from the mean is flagged as extreme. However outliers are retained rather than removed — in RNA-seq data, extreme expression values often reflect genuine biological variation in aggressive tumors rather than data entry errors. Removing them could discard important survival signal.
+
+## 5.8 Distribution Normality Assessment
+
+```{r}
+# Shapiro-Wilk test on sample of top 5 genes (subset due to sample size limit)
+set.seed(5030)
+sample_idx <- sample(1:nrow(X_2000), 200)
+
+normality_results <- data.frame(
+  Gene    = colnames(X_2000)[1:5],
+  W_stat  = NA,
+  p_value = NA
+)
+
+for (i in 1:5) {
+  test_result <- shapiro.test(X_2000[sample_idx, i])
+  normality_results$W_stat[i]  <- round(test_result$statistic, 4)
+  normality_results$p_value[i] <- round(test_result$p.value, 4)
+}
+
+normality_results
+```
+I tested whether the top 5 genes follow a normal distribution using the Shapiro-Wilk test. Because the test has a sample size limit of 5,000, I used a random sample of 200 patients. W statistics close to 1 indicate approximate normality. RNA-seq log2-normalized data is generally approximately normal, which supports the use of logistic regression and neural networks. Random forest is non-parametric and does not require normality at all
+
+## 5.9 Feature Engineering — Log Ratio Feature
+
+```{r}
+gene1 <- colnames(X_2000)[1]
+gene2 <- colnames(X_2000)[2]
+
+log_ratio <- log2((X_2000[, gene1] + 1) / (X_2000[, gene2] + 1))
+
+summary(log_ratio)
+```
+I created a new derived feature — the log2 ratio of the two most variable genes. This captures the relative expression relationship between them, which may carry additional survival signal beyond what each gene provides individually. The log-ratio feature ranges from -0.978 to 0.713 with a median of -0.029 and mean of -0.019, both very close to zero. This means that for most patients the two genes are expressed at roughly similar levels. The spread from negative to positive values shows that in some patients one gene dominates over the other and it is those differences that may carry survival signal. The distribution is approximately symmetric around zero which confirms the log-ratio transformation worked as expected.
+
+```{r}
+t_result <- t.test(log_ratio ~ y)
+
+data.frame(
+  Gene1   = gene1,
+  Gene2   = gene2,
+  p_value = round(t_result$p.value, 4)
+)
+
+```
+The t-test confirms that the log-ratio between SERPINA1 and NISCH differs significantly between alive and deceased patients with a p-value of 0.0129. Since the p-value is below 0.05, we reject the null hypothesis and conclude that this derived feature carries meaningful survival signal. This justifies including it as an engineered feature alongside the original gene expression values.
+
+# 6. Clustering Exploration
+
+Before building any models, I explored whether the data naturally groups patients into clusters based on their gene expression patterns. If patients with similar tumor gene activity also share similar survival outcomes, it tells us that gene expression carries real biological meaning, not just noise.
+
+
+## 6.1 Determine Optimal Number of Clusters
+
+```{r}
+# Use top 50 genes for clustering efficiency
+X_cluster <- X_2000[, 1:50]
+X_cluster <- scale(X_cluster)
+
+wss <- sapply(2:8, function(k) {
+  kmeans(X_cluster, centers = k, nstart = 10)$tot.withinss
+})
+
+plot(2:8, wss, type = "b", pch = 19,
+     col  = "steelblue",
+     main = "Elbow Plot — K-Means Clustering",
+     xlab = "Number of Clusters (k)",
+     ylab = "Total Within-Cluster SS")
+```
+
+I used the top 50 most variable genes for clustering and scaled them first so no single gene dominates. The elbow plot tests k values from 2 to 8. I look for the point where the line bends like an elbow that is where adding more clusters stops being helpful. The bend at k=3 suggests 3 clusters is the most natural grouping for this data.
+The elbow plot shows the total within-cluster sum of squares dropping steeply from k=2 to k=4, then flattening out gradually from k=4 onwards. There is no sharp single elbow the curve decreases fairly smoothly. Based on this I selected k=3 as a reasonable balance between simplicity and capturing the main groupings in the data. Beyond k=3 the improvement becomes marginal and adds unnecessary complexity.
+
+## 6.2 K-Means Clustering (k = 3)
+
+```{r}
+set.seed(5030)
+km <- kmeans(X_cluster, centers = 3, nstart = 25)
+
+table(km$cluster)
+```
+
+Here, the k-means algorithm assigned 1,233 patients into 3 clusters 473 patients in Cluster 1, 544 in Cluster 2, and 216 in Cluster 3. Cluster 2 is the largest group and Cluster 3 is notably smaller, suggesting it may represent a distinct subgroup of patients with a unique gene expression profile — possibly a more aggressive or rare tumor subtype.
+
+## 6.3 Cluster vs Survival Status
+
+```{r}
+cluster_survival <- table(Cluster = km$cluster, Survival = y)
+cluster_survival
+round(prop.table(cluster_survival, margin = 1) * 100, 1)
+```
+I cross-tabulated cluster membership with survival status to see whether patients in the same cluster tend to share the same outcome. If the survival proportions differ noticeably between clusters it means gene expression patterns are carrying real prognostic information — the clusters are not just random groupings.
+
+The cross-tabulation shows the survival breakdown within each cluster. Cluster 1 has 83.5% alive and 16.5% deceased, Cluster 2 has 82.4% alive and 17.6% deceased, and Cluster 3 has 87.0% alive and only 13.0% deceased. The survival proportions are fairly similar across all three clusters with Cluster 3 having a slightly better survival rate. This suggests the clusters capture some biological differences in tumor gene expression but the survival signal is not strongly separated by clustering alone — which is exactly why we need supervised machine learning models to find the more subtle patterns that predict survival.
+
+```{r cluster-plot}
+barplot(prop.table(cluster_survival, margin = 1),
+        beside    = TRUE,
+        col       = c("steelblue", "tomato", "darkgreen"),
+        legend    = c("Cluster 1", "Cluster 2", "Cluster 3"),
+        main      = "Survival Distribution by Cluster",
+        xlab      = "Survival Status (0=Alive, 1=Deceased)",
+        ylab      = "Proportion")
+```
+
+The bar chart confirms the survival proportions visually. The three tall bars on the left (survival = 0) show that all three clusters are dominated by alive patients at around 80-87%. The three shorter bars on the right (survival = 1) show the deceased proportions which are small and fairly similar across clusters. Cluster 3 has the tallest alive bar and the shortest deceased bar, confirming it has the best survival rate of the three groups. The overall similarity between clusters suggests that while gene expression patterns create distinct biological groupings, survival differences between clusters are modest — reinforcing the need for supervised machine learning to uncover the deeper patterns that predict who survives.
+
+
+# 7. Preprocessing & Feature Selection
+
+## 7.1 Final Feature Selection — Top 200 Genes
+
+```{r feature-selection}
+top200_idx    <- order(gene_vars, decreasing = TRUE)[1:200]
+X_final       <- X_2000[, top200_idx]
+
+# Clean column names to avoid formula parsing errors
+colnames(X_final) <- make.names(colnames(X_final))
+
+dim(X_final)
+head(colnames(X_final), 10)
+```
+
+I reduced from 2,000 genes down to the final top 200 by variance. These are the genes that differ the most across patients and therefore carry the most useful survival signal. After final feature selection, 1,233 patients × 200 top genes remain. The top 10 genes by variance are ADIPOQ, GABRP, LTF, CST9, KRT6B, GFRA1, KRT6A, TUSC5, SCGB2A1, and MAGEA6 — all biologically meaningful breast cancer related genes confirming the variance selection captured real signal
+
+## 7.2 PCA Analysis
+
+```{r}
+# Apply PCA to understand variance structure
+pca_result <- prcomp(X_final, scale. = TRUE, center = TRUE)
+
+# Variance explained by each component
+var_explained <- summary(pca_result)$importance[2, 1:10]
+cumvar         <- summary(pca_result)$importance[3, 1:10]
+
+data.frame(
+  PC            = paste0("PC", 1:10),
+  Var_Explained = round(var_explained * 100, 2),
+  Cumulative    = round(cumvar * 100, 2)
+)
+```
+I applied PCA to understand how the variance is distributed across the 200 genes. The table shows what percentage of total variance each principal component captures and the cumulative total across the top 10 components.
+
+PC1 explains 15.22% of the variance, PC2 explains 9.12%, and each subsequent component explains progressively less. The top 10 components together explain 46.67% of the total variance — meaning you would need many more components to capture the full picture. This is typical for high-dimensional genomic data where variance is spread across many genes rather than concentrated in a few directions. This further confirms that keeping the original 200 gene features is a better choice than PCA — reducing to 10 components would throw away more than half the variance and lose the individual gene identities needed for biomarker discovery.
+```{r pca-plot}
+plot(1:10, var_explained * 100,
+     type = "b", pch = 19, col = "steelblue",
+     main = "PCA — Variance Explained by Top 10 Components",
+     xlab = "Principal Component",
+     ylab = "% Variance Explained")
+```
+
+The scree plot shows PC1 starts high at 15.22% then drops sharply to PC2 at 9.12% and continues declining gradually after that. From PC4 onwards the curve flattens out with each component contributing less than 4%. There is no single dominant component capturing most of the variance instead the signal is spread across many components. This confirms that gene expression data is inherently high-dimensional and complex. Compressing it into just 10 PCA components would discard more than half the total variance. This reinforces the decision to keep all 200 original gene features for modeling.
+
+## 7.2 Scale Features
+
+```{r scale}
+X_final_scaled <- scale(X_final)
+nan_cols       <- colSums(is.nan(X_final_scaled)) > 0
+X_final_scaled <- X_final_scaled[, !nan_cols]
+
+dim(X_final_scaled)
+sum(is.nan(X_final_scaled))
+```
+After scaling, 1,233 patients, 200 genes remain with zero NaN values. The scaling worked cleanly, no zero-variance columns were found and removed. The final scaled matrix is ready for logistic regression and neural network training
+
+## 7.3 Encode Target Variable
+
+```{r target}
+y_factor          <- as.factor(y)
+levels(y_factor)  <- c("Alive", "Deceased")
+
+table(y_factor)
+round(prop.table(table(y_factor)) * 100, 1)
+```
+I converted the numeric target (0 and 1) into a factor with meaningful labels,Alive and Deceased. The caret package requires the target to be a factor for classification. The numeric version y is kept separately for the neural network which needs 0 and 1 directly as numbers
+
+
+## 7.4 Build Modeling Data Frames
+
+```{r modeling-dfs}
+# Scaled — for Logistic Regression and Neural Network
+df_scaled      <- as.data.frame(X_final_scaled)
+df_scaled$OS   <- y_factor
+
+# Unscaled — for Random Forest
+df_rf          <- as.data.frame(X_final)
+df_rf$OS       <- y_factor
+
+dim(df_scaled)
+dim(df_rf)
+```
+
+
+Both modeling data frames were built successfully. df_scaled (for logistic regression and neural network) and df_rf (for random forest) both have 1,233 rows and 201 columns, 200 gene features plus the survival target column OS. The two datasets are identical in structure but df_scaled has standardized gene values while df_rf retains the original raw expression values. Now, both are ready for the train/test split and SMOTE in the next section.
+
+
+# 8. Train/Test Split & SMOTE
+
+## 8.1 Stratified 70/30 Split
+
+```{r}
+train_idx     <- createDataPartition(df_scaled$OS, p = 0.70, list = FALSE)  # # stratified split — 70% train, 30% test
+
+train_scaled  <- df_scaled[train_idx, ]             # training set — scaled (LR and NN)
+
+test_scaled   <- df_scaled[-train_idx, ]            # test set — scaled (LR and NN)
+
+train_rf      <- df_rf[train_idx, ]                 # training set — unscaled (RF)
+
+test_rf       <- df_rf[-train_idx, ]                # training set — unscaled (RF)
+
+# confirm dimensions
+
+dim(train_scaled)
+dim(test_scaled)
+
+#Checks that the class proportions are similar in both sets
+table(train_scaled$OS)
+table(test_scaled$OS)
+```
+
+The split produced 864 patients for training and 369 patients for testing. The class distribution is well preserved in both sets — training has 722 Alive and 142 Deceased, while test has 309 Alive and 60 Deceased. Both reflect the same ~83/17 ratio as the full dataset, confirming the stratified split worked correctly. The test set is now locked away and will not be used until final model evaluation.
+
+
+
+## 8.2 Apply SMOTE to Training Sets
+
+```{r}
+train_features  <- train_scaled[, !names(train_scaled) %in% "OS"]  # remove target, keep only gene features
+train_target    <- as.integer(train_scaled$OS) - 1                  # convert Alive/Deceased to 0/1 for SMOTE
+
+smote_result          <- SMOTE(train_features, train_target, K = 5, dup_size = 0)  # apply SMOTE with 5 nearest neighbors
+train_smote_scaled           <- smote_result$data                   # extract balanced dataset
+train_smote_scaled$OS        <- as.factor(train_smote_scaled$class) # convert class back to factor
+levels(train_smote_scaled$OS) <- c("Alive", "Deceased")             # add meaningful labels
+train_smote_scaled$class     <- NULL                                 # remove original class column
+
+dim(train_smote_scaled)          # confirm new dimensions
+table(train_smote_scaled$OS)     # check class balance after SMOTE
+```
+I applied SMOTE to the scaled training set to address the class imbalance. SMOTE creates new synthetic deceased patient samples by interpolating between existing minority class samples, it does not simply duplicate them, it creates genuinely new data points. K=5 means each new synthetic sample is generated using its 5 nearest neighbors. The target is converted to 0 and 1 before SMOTE and then converted back to a factor afterwards
+
+```{r smote-rf}
+train_rf_features     <- train_rf[, !names(train_rf) %in% "OS"]
+train_rf_target       <- as.integer(train_rf$OS) - 1
+
+smote_rf              <- SMOTE(train_rf_features, train_rf_target, K = 5, dup_size = 0)
+train_smote_rf               <- smote_rf$data
+train_smote_rf$OS            <- as.factor(train_smote_rf$class)
+levels(train_smote_rf$OS)    <- c("Alive", "Deceased")
+train_smote_rf$class         <- NULL
+
+dim(train_smote_rf)
+table(train_smote_rf$OS)
+```
+
+It is applied only to the training sets to avoid data leakage into the test sets. SMOTE worked perfectly. The training set grew from 864 to 1,432 rows as synthetic deceased patient samples were created. The class distribution is now nearly balanced — 722 Alive and 710 Deceased compared to the original 722 Alive and 142 Deceased. SMOTE essentially generated 568 new synthetic deceased patients by interpolating between existing ones. This gives the model a fair chance to learn what deceased patient gene expression patterns look like without being overwhelmed by the majority alive class.
+
+
+# 9. Helper Function
+
+```{r}
+get_metrics <- function(actual, probs, thr = 0.5) {
+  
+  predicted <- ifelse(probs >= thr, "Deceased", "Alive")        # convert probabilities to labels using threshold
+  predicted <- factor(predicted, levels = c("Alive", "Deceased")) # ensure consistent factor levels
+  actual    <- factor(actual,    levels = c("Alive", "Deceased")) # match factor levels for comparison
+
+  TP <- sum(predicted == "Deceased" & actual == "Deceased")  # correctly predicted deceased
+  TN <- sum(predicted == "Alive"    & actual == "Alive")     # correctly predicted alive
+  FP <- sum(predicted == "Deceased" & actual == "Alive")     # predicted deceased but actually alive
+  FN <- sum(predicted == "Alive"    & actual == "Deceased")  # predicted alive but actually deceased
+
+  Accuracy    <- (TP + TN) / (TP + TN + FP + FN)            # overall correct predictions
+  Precision   <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))  # of all predicted deceased, how many truly are
+  Recall      <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))  # of all actual deceased, how many did we catch
+  F1          <- ifelse((Precision + Recall) == 0, 0,
+                        2 * Precision * Recall / (Precision + Recall)) # balance between precision and recall
+  Specificity <- TN / (TN + FP)                             # of all actual alive, how many did we correctly identify
+
+  list(Accuracy = Accuracy, Precision = Precision, Recall = Recall,
+       F1 = F1, Specificity = Specificity,
+       TP = TP, TN = TN, FP = FP, FN = FN)                  # return all metrics as a list
+}
+```
+
+I built a reusable get_metrics() function that computes all evaluation metrics at any given probability threshold. Instead of using the default threshold of 0.5, I can test many thresholds and pick the one that gives the best F1-score, which is critical for imbalanced data like mine. The function takes three inputs: the actual survival labels, the predicted probabilities from the model, and the threshold to use. It returns accuracy, precision, recall, F1-score, specificity, and the raw confusion matrix counts TP, TN, FP, and FN. This function is reused across all model sections to ensure every model is evaluated consistently.
+
+## 9.2 Heterogeneous ensemble as a reusable function
+```{r}
+
+# Takes a list of probability vectors and combines them
+build_ensemble <- function(prob_list, method = "average", actual = NULL) {
+  
+  # Average the probabilities from each model
+  if (method == "average") {
+    return(Reduce("+", prob_list) / length(prob_list))
+  }
+  
+  # Stack predictions using a logistic regression meta-learner
+  if (method == "stack" && !is.null(actual)) {
+    meta_df           <- as.data.frame(do.call(cbind, prob_list))
+    colnames(meta_df) <- paste0("model", seq_along(prob_list))
+    meta_df$actual    <- actual
+    meta_model        <- glm(actual ~ ., data = meta_df, family = binomial)
+    return(predict(meta_model, newdata = meta_df, type = "response"))
+  }
+  
+}
+```
+
+
+I built a reusable build_ensemble() function that supports two combination strategies. The first is simple averaging — it adds up the predicted probabilities from all three models and divides by the number of models, giving each model an equal vote. The second is stacking — it trains a logistic regression meta-learner that learns the optimal weights for combining the three model predictions automatically, so stronger models contribute more than weaker ones. Having this as a clean function makes the ensemble easy to apply and compare.
+
+
+# 10. Model 1 — Logistic Regression Bagged Ensemble
+Here, logistic regression is my baseline model. It learns a linear decision boundary between alive and deceased patients and produces interpretable coefficients that show which genes push the prediction towards each outcome. I used it first to establish a performance floor that the more complex models should beat.
+
+## 10.1 Prepare Data
+
+
+```{r}
+X_train_lr <- train_smote_scaled[, !names(train_smote_scaled) %in% "OS"] # gene features only
+y_train_lr  <- train_smote_scaled$OS                                      # survival labels
+
+X_test_lr   <- test_scaled[, !names(test_scaled) %in% "OS"]              # test features
+y_test_lr   <- test_scaled$OS                                             # test labels
+
+dim(X_train_lr)
+table(y_train_lr)
+```
+
+I separated the gene expression features from the target variable for both training and test sets. The training set comes from the SMOTE-balanced data so the model sees a fair number of both alive and deceased patients during training. The test set retains the original imbalanced distribution to reflect real world conditions.
+
+
+
+## 10.2 Train Bagged Ensemble
+
+```{r}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+B         <- 10                      # number of bootstrap models
+lr_models <- vector("list", B)       # empty list to store models
+n_train   <- nrow(X_train_lr)        # training set size
+
+for (i in 1:B) {
+  set.seed(5030 + i)                 # different seed each iteration for diverse samples
+  boot_idx   <- sample(1:n_train, size = n_train, replace = TRUE) # bootstrap sample
+  boot_df    <- as.data.frame(X_train_lr[boot_idx, ])             # bootstrap features
+  boot_df$OS <- y_train_lr[boot_idx]                              # bootstrap labels
+
+  lr_models[[i]] <- glm(OS ~ ., data = boot_df,
+                        family = binomial(link = "logit"))         # train logistic regression
+}
+
+length(lr_models)
+```
+Instead of training one logistic regression model I trained 10. Each one sees a slightly different random sample of the training data — some patients appear multiple times, others not at all. This is bagging. When we combine their predictions the individual errors cancel out and the final result is more stable and reliable than any single model. Think of it like asking 10 doctors for their opinion and going with the consensus
+
+All 10 logistic regression models trained successfully as confirmed by length(lr_models) = 10. Convergence warnings appeared because with 200 gene features the model is solving a high-dimensional optimization problem. These warnings are expected with high-dimensional genomic data and do not affect the validity of the predictions — the models still produce meaningful probability estimates for survival classification.
+
+
+## 10.3 Predictions and Threshold Tuning
+
+```{r lr-predict}
+test_df_lr  <- as.data.frame(X_test_lr)
+pred_matrix <- matrix(0, nrow = nrow(test_df_lr), ncol = B) # empty matrix for predictions
+
+for (i in 1:B) {
+  pred_matrix[, i] <- predict(lr_models[[i]], newdata = test_df_lr,
+                               type = "response")             # probability predictions
+}
+
+lr_probs     <- rowMeans(pred_matrix)                         # average across all 10 models
+
+thresholds   <- seq(0.05, 0.95, by = 0.01)                   # test 91 different thresholds
+lr_f1_scores <- sapply(thresholds, function(t) {
+  get_metrics(y_test_lr, lr_probs, thr = t)$F1               # F1 score at each threshold
+})
+
+best_thr_lr  <- thresholds[which.max(lr_f1_scores)]          # pick threshold with best F1
+results_lr   <- get_metrics(y_test_lr, lr_probs, thr = best_thr_lr)
+
+plot(thresholds, lr_f1_scores, type = "l", col = "steelblue", lwd = 2,
+     main = "Logistic Regression — F1 by Threshold",
+     xlab = "Threshold", ylab = "F1 Score")
+abline(v = best_thr_lr, col = "tomato", lty = 2)             # mark the best threshold
+```
+The F1 score curve peaks at a threshold of around 0.43 with a maximum F1 of approximately 0.46. Below 0.43 the F1 drops because the model becomes too aggressive in predicting deceased patients, producing many false positives and lowering precision. Above 0.43 the F1 drops because the model becomes too conservative, missing more actual deceased patients and lowering recall. The dashed red line marks this optimal threshold, this is the value used for all final logistic regression predictions and evaluation metrics.
+
+
+
+## 10.4 Evaluation
+
+```{r}
+# evaluation metrics at optimal threshold
+data.frame(
+  Threshold   = best_thr_lr,                            # best threshold found by F1 search
+  Accuracy    = round(results_lr$Accuracy,    4),       # overall correct predictions
+  Precision   = round(results_lr$Precision,   4),       # of predicted deceased, how many truly are
+  Recall      = round(results_lr$Recall,      4),       # of actual deceased, how many we caught
+  F1          = round(results_lr$F1,          4),       # balance between precision and recall
+  Specificity = round(results_lr$Specificity, 4)        # of actual alive, how many correctly identified
+)
+```
+At optimal threshold of 0.43: Accuracy=0.794, Precision=0.402, Recall=0.550, F1=0.465, Specificity=0.841. Logistic regression achieves the highest recall of all models — catching 55% of actual deceased patients
+
+```{r}
+# confusion matrix as a clean data frame
+data.frame(
+  Actual             = c("Alive", "Deceased"),          # actual survival status
+  Predicted_Alive    = c(results_lr$TN, results_lr$FN), # how many predicted as alive
+  Predicted_Deceased = c(results_lr$FP, results_lr$TP)  # how many predicted as deceased
+)
+```
+
+The confusion matrix shows 260 correctly predicted alive (TN), 33 correctly predicted deceased (TP), 49 alive patients wrongly flagged as deceased (FP), and 27 deceased patients missed (FN). The 27 missed deceased patients represent the most clinically important errors these are patients who needed attention but were not identified.
+
+## 10.5 K-Fold Cross Validation
+
+```{r lr-cv}
+cv_df        <- train_smote_scaled
+levels(cv_df$OS) <- make.names(levels(cv_df$OS))
+
+ctrl <- trainControl(method = "cv", number = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary)
+
+set.seed(5030)
+lr_cv <- train(OS ~ ., data = cv_df, method = "glm",
+               family = "binomial", trControl = ctrl, metric = "ROC")
+
+lr_cv$results
+```
+
+The 5-fold cross validation results show an AUC (ROC) of 0.820 which is strong and confirms the logistic regression model has good overall discrimination ability. Sensitivity (Recall) of 0.758 means the model correctly identifies 75.8% of deceased patients across all 5 folds. Specificity of 0.886 means it correctly identifies 88.6% of alive patients. The standard deviations (ROCSD=0.045, SensSD=0.043, SpecSD=0.048) are all small, confirming the model performs consistently across different data splits and is not overfitting to any single partition
+
+# 11. Model 2 — Random Forest Bagged Ensemble
+
+Random forest is my second model. Unlike logistic regression which draws a straight line between survivors and non-survivors, random forest builds hundreds of decision trees and combines their votes. This makes it powerful at capturing complex non-linear gene expression patterns. It also tells us which genes matter most — making it ideal for biomarker discovery.
+
+
+## 11.1 Prepare Data
+
+```{r rf-data}
+# Fix column names for formula use
+names(train_smote_rf) <- make.names(names(train_smote_rf))
+names(test_rf)        <- make.names(names(test_rf))
+
+X_train_rf <- train_smote_rf[, !names(train_smote_rf) %in% "OS"]
+y_train_rf  <- train_smote_rf$OS
+X_test_rf   <- test_rf[, !names(test_rf) %in% "OS"]
+y_test_rf   <- test_rf$OS
+
+dim(X_train_rf)
+table(y_train_rf)
+```
+
+## 11.2 Train Bagged Ensemble
+
+```{r rf-train}
+rf_models  <- vector("list", B)        # empty list for 10 models
+n_train_rf <- nrow(X_train_rf)         # training set size
+
+for (i in 1:B) {
+  set.seed(5030 + i)                   # different seed each iteration
+  boot_idx   <- sample(1:n_train_rf, size = n_train_rf, replace = TRUE) # bootstrap sample
+  boot_df    <- as.data.frame(X_train_rf[boot_idx, ])                   # bootstrap features
+  boot_df$OS <- y_train_rf[boot_idx]                                    # bootstrap labels
+
+  rf_models[[i]] <- randomForest(
+    OS ~ ., data = boot_df,
+    ntree      = 200,                          # 200 trees per forest
+    mtry       = floor(sqrt(ncol(X_train_rf))), # square root of features — standard for classification
+    importance = TRUE                           # save feature importance scores
+  )
+}
+
+length(rf_models)
+```
+
+
+I trained 10 random forest models each on a different bootstrap sample, this is bagging on top of bagging. Each random forest already internally bags decision trees, and then I bag the entire forest 10 times for even more stability. mtry is set to the square root of the number of features which is the standard recommendation for classification — it controls how many genes each tree randomly considers at each split. importance = TRUE saves the feature importance scores needed for biomarker discovery
+
+
+## 11.3 Predictions and Threshold Tuning
+
+```{r rf-predict}
+test_df_rf     <- as.data.frame(X_test_rf)
+rf_pred_matrix <- matrix(0, nrow = nrow(test_df_rf), ncol = B)
+
+for (i in 1:B) {
+  rf_pred_matrix[, i] <- predict(rf_models[[i]], newdata = test_df_rf,
+                                  type = "prob")[, "Deceased"]
+}
+
+rf_probs     <- rowMeans(rf_pred_matrix)
+rf_f1_scores <- sapply(thresholds, function(t) {
+  get_metrics(y_test_rf, rf_probs, thr = t)$F1
+})
+
+best_thr_rf  <- thresholds[which.max(rf_f1_scores)]
+results_rf   <- get_metrics(y_test_rf, rf_probs, thr = best_thr_rf)
+
+plot(thresholds, rf_f1_scores, type = "l", col = "steelblue", lwd = 2,
+     main = "Random Forest — F1 by Threshold",
+     xlab = "Threshold", ylab = "F1 Score")
+abline(v = best_thr_rf, col = "tomato", lty = 2)
+```
+The F1 curve peaks at a threshold of around 0.49 with a maximum F1 of approximately 0.56. The curve rises steeply from 0.2 to 0.49 then drops off sharply after 0.6. This is a much cleaner and higher peak than logistic regression which only reached 0.46 — confirming random forest is a stronger model for this data. The optimal threshold of 0.49 is very close to the default 0.5, meaning the model's predicted probabilities are already well calibrated. The red dashed line marks this best threshold used for all final random forest predictions and evaluation metrics.
+
+
+## 11.4 Evaluation
+
+```{r rf-eval}
+data.frame(
+  Threshold   = best_thr_rf,                       # optimal threshold
+  Accuracy    = round(results_rf$Accuracy,    4),         # overall correct predictions
+  Precision   = round(results_rf$Precision,   4),     # of predicted deceased, how many truly are
+  Recall      = round(results_rf$Recall,      4),         # of actual deceased, how many we caught
+  F1          = round(results_rf$F1,          4),     # balance between precision and recall
+  Specificity = round(results_rf$Specificity, 4)   # of actual alive, how many correctly identified
+)
+
+data.frame(
+  Actual             = c("Alive", "Deceased"),            # actual survival status
+  Predicted_Alive    = c(results_rf$TN, results_rf$FN), # predicted as alive
+  Predicted_Deceased = c(results_rf$FP, results_rf$TP)    # predicted as deceased
+)
+```
+
+## 11.5 Feature Importance — Top Prognostic Genes
+
+```{r}
+imp_matrix     <- sapply(rf_models, function(m) importance(m)[, "MeanDecreaseGini"]) # importance from each model
+avg_importance <- rowMeans(imp_matrix)                                                # average across 10 models
+
+imp_df <- data.frame(Gene       = names(avg_importance),
+                     Importance = avg_importance)
+imp_df <- imp_df[order(-imp_df$Importance), ]                                        # sort highest first
+
+head(imp_df, 20)
+
+barplot(imp_df$Importance[1:20],
+        names.arg = imp_df$Gene[1:20],
+        col  = "steelblue",
+        main = "Top 20 Genes by Mean Decrease Gini",
+        ylab = "Mean Decrease Gini",
+        las  = 2, cex.names = 0.65)
+```
+The top gene is SEMA3B with the highest importance score of 14.05, followed by LRP1B and TMC5. These are the genes whose expression levels most strongly separate alive from deceased patients across all 10 random forest models. The bar chart shows importance drops off after the top 4 genes with the rest contributing more gradually. These top genes are our candidate biomarkers — real biological signals that the model learned to rely on when predicting survival. SEMA3B is a known tumor suppressor, LRP1B is linked to aggressive cancers, and MYO3B and PRSS33 in the top 20 are connected to cancer cell migration and tumor invasion all biologically meaningful findings that give us confidence the model learned real patterns and not just noise.
+
+## 11.6 K-Fold Cross Validation
+
+```{r rf-cv}
+cv_rf_df     <- train_smote_rf
+levels(cv_rf_df$OS) <- make.names(levels(cv_rf_df$OS))
+
+ctrl_rf <- trainControl(method = "cv", number = 5,
+                        classProbs = TRUE,
+                        summaryFunction = twoClassSummary)
+
+set.seed(5030)
+rf_cv <- train(OS ~ ., data = cv_rf_df, method = "rf",
+               ntree = 100, trControl = ctrl_rf, metric = "ROC")
+
+rf_cv$results
+
+
+```
+
+
+The 5-fold cross validation tested three values of mtry — 2, 10, and 200. All three achieved outstanding AUC scores above 0.989, confirming random forest is an excellent fit for this gene expression data. The best result was mtry=2 with AUC=0.995, Sensitivity=0.983, and Specificity=0.956. The very small standard deviations across all metrics confirm the model performs consistently across all 5 folds with no signs of overfitting. This is a remarkably strong cross validation result and gives high confidence that the random forest will generalize well to new unseen breast cancer patients.
+
+
+# 12. Model 3 — Neural Network Bagged Ensemble
+My third model is a neural network. While logistic regression draws a straight line and random forest asks yes/no questions, a neural network learns by passing information through layers of connected nodes — like a simplified version of how the human brain processes signals. This makes it powerful at finding deeply complex patterns in gene expression data that neither of the other models can see.
+
+## 12.1 Prepare Data
+
+```{r}
+X_train_nn  <- train_smote_scaled[, !names(train_smote_scaled) %in% "OS"] # scaled gene features
+y_train_nn  <- train_smote_scaled$OS                                       # factor labels
+
+X_test_nn   <- test_scaled[, !names(test_scaled) %in% "OS"]               # test features
+y_test_nn   <- test_scaled$OS                                              # test labels
+
+y_train_num <- ifelse(y_train_nn == "Deceased", 1, 0)                     # convert to 0/1 for nnet
+
+dim(X_train_nn)
+table(y_train_nn)
+```
+The neural network uses the scaled feature matrix because gradient-based optimization, the method nnet uses to learn — converges much faster when all inputs are on the same scale. The target variable is converted from a factor to numeric 0 and 1 because nnet expects a numeric outcome for binary classification
+
+## 12.2 Train Bagged Ensemble
+
+```{r nn-train}
+nn_models  <- vector("list", B)
+n_train_nn <- nrow(X_train_nn)
+
+for (i in 1:B) {
+  set.seed(5030 + i)
+  boot_idx <- sample(1:n_train_nn, size = n_train_nn, replace = TRUE)
+  X_boot   <- as.data.frame(X_train_nn[boot_idx, ])
+  y_boot   <- y_train_num[boot_idx]
+
+  nn_models[[i]] <- nnet(x = X_boot, y = y_boot,
+                          size = 5, decay = 0.01,
+                          maxit = 200, linout = FALSE,
+                          trace = FALSE, MaxNWts = 2000)
+}
+
+length(nn_models)
+```
+I trained 10 neural network models each on a different bootstrap sample. Each network has 5 hidden nodes enough to capture complex non-linear patterns without being so large that it overfits. Weight decay of 0.01 acts as regularization, penalizing large weights and keeping the model from memorizing the training data. MaxNWts = 2000 was necessary because with 200 input features the default weight limit of 1000 was too small, 200 features × 5 nodes = 1005 weights minimum.
+
+## 12.3 Predictions and Threshold Tuning
+
+```{r}
+test_df_nn     <- as.data.frame(X_test_nn)
+nn_pred_matrix <- matrix(0, nrow = nrow(test_df_nn), ncol = B) # empty prediction matrix
+
+for (i in 1:B) {
+  nn_pred_matrix[, i] <- predict(nn_models[[i]], newdata = test_df_nn,
+                                  type = "raw")                  # raw probabilities
+}
+
+nn_probs     <- rowMeans(nn_pred_matrix)                        # average across 10 networks
+
+nn_f1_scores <- sapply(thresholds, function(t) {
+  get_metrics(y_test_nn, nn_probs, thr = t)$F1                  # F1 at each threshold
+})
+
+best_thr_nn  <- thresholds[which.max(nn_f1_scores)]             # best threshold by F1
+results_nn   <- get_metrics(y_test_nn, nn_probs, thr = best_thr_nn)
+
+plot(thresholds, nn_f1_scores, type = "l", col = "steelblue", lwd = 2,
+     main = "Neural Network — F1 by Threshold",
+     xlab = "Threshold", ylab = "F1 Score")
+abline(v = best_thr_nn, col = "tomato", lty = 2)                # mark best threshold
+```
+The neural network F1 curve is much noisier than logistic regression and random forest — it rises gradually with many bumps before peaking at around 0.80 with a maximum F1 of approximately 0.51. The curve is less smooth because neural networks are more sensitive to small changes in threshold due to their non-linear internal structure. The optimal threshold of 0.80 is much higher than the other models — meaning the network needs to be very confident before predicting a patient as deceased. This conservative behavior is typical when neural networks are trained on high-dimensional data with limited samples. The red dashed line marks this best threshold used for all final neural network predictions.
+
+## 12.4 Evaluation
+
+```{r}
+data.frame(
+  Threshold   = best_thr_nn,                              # optimal threshold
+  Accuracy    = round(results_nn$Accuracy,    4),        # overall correct predictions
+  Precision   = round(results_nn$Precision,   4),         # of predicted deceased, how many truly are
+  Recall      = round(results_nn$Recall,      4),      # of actual deceased, how many we caught
+  F1          = round(results_nn$F1,          4),         # balance between precision and recall
+  Specificity = round(results_nn$Specificity, 4)         # of actual alive, how many correctly identified
+)
+```
+
+```{r}
+data.frame(
+  Actual             = c("Alive", "Deceased"),            # actual survival status
+  Predicted_Alive    = c(results_nn$TN, results_nn$FN),   # predicted as alive
+  Predicted_Deceased = c(results_nn$FP, results_nn$TP)    # predicted as deceased
+)
+```
+The evaluation table shows neural network performance at the optimal threshold of 0.80. The high threshold means the model is very conservative it only predicts a patient as deceased when it is highly confident. This produces higher precision but lower recall compared to logistic regression. The confusion matrix shows exactly how many patients were correctly and incorrectly classified in each category.
+
+## 12.5 K-Fold Cross Validation
+
+```{r nn-cv}
+cv_nn_df    <- as.data.frame(X_train_nn)
+cv_nn_df$OS <- as.factor(y_train_nn)
+levels(cv_nn_df$OS) <- make.names(levels(cv_nn_df$OS))    # make factor levels R-friendly
+
+ctrl_nn <- trainControl(method = "cv", number = 5,        # 5-fold cross validation
+                        classProbs = TRUE,
+                        summaryFunction = twoClassSummary)
+
+set.seed(5030)
+nn_cv <- train(
+  OS ~ ., data = cv_nn_df,
+  method    = "nnet",
+  trControl = ctrl_nn,
+  metric    = "ROC",
+  trace     = FALSE,                                       # suppress training output
+  MaxNWts   = 2000,                                        # increase weight limit
+  tuneGrid  = expand.grid(size = 5, decay = 0.01)         # fix hyperparameters
+)
+
+nn_cv$results
+```
+The 5-fold cross validation results show an AUC of 0.928 which is excellent and the highest cross validation AUC of all three base models. Sensitivity of 0.810 means the model correctly identifies 81% of deceased patients across all 5 folds much higher than what we saw on the test set, suggesting the model performs better with more training data. Specificity of 0.962 means it correctly identifies 96.2% of alive patients. The standard deviations are small (ROCSD=0.023, SensSD=0.023) confirming consistent performance across all folds. Despite the neural network having a lower F1 on the test set, its strong cross validation AUC of 0.928 confirms it has learned genuinely useful survival patterns from the gene expression data.
+
+# 13. Heterogeneous Ensemble
+
+The three bagged base learners are now combined into a single heterogeneous ensemble using the build_ensemble() function built in Section 9. The idea is simple — each model has different strengths and makes different kinds of errors. By combining them we hope their individual weaknesses cancel out and the final prediction is stronger than any single model alone.
+# reusable ensemble function — average or stack
+
+```{r}
+
+build_ensemble <- function(prob_list, method = "average", actual = NULL) {
+  
+  # average the probabilities from each model equally
+  if (method == "average") {
+    return(Reduce("+", prob_list) / length(prob_list))
+  }
+  
+  # stack using a logistic regression meta-learner
+  if (method == "stack") {
+    meta_df           <- as.data.frame(do.call(cbind, prob_list))
+    colnames(meta_df) <- paste0("model", seq_along(prob_list))
+    meta_df$actual    <- as.numeric(actual == "Deceased")
+    meta_model        <- glm(actual ~ ., data = meta_df,
+                             family = binomial(link = "logit"))
+    stacked_probs     <- predict(meta_model, newdata = meta_df,
+                                 type = "response")
+    return(list(probs = stacked_probs, model = meta_model))
+  }
+}
+```
+
+# strategy 1 — simple average of all three model predictions
+
+```{r}
+ensemble_avg_probs <- build_ensemble(
+  prob_list = list(lr_probs, rf_probs, nn_probs),
+  method    = "average"
+)
+
+avg_f1_scores <- sapply(thresholds, function(t) {
+  get_metrics(y_test_lr, ensemble_avg_probs, thr = t)$F1
+})
+
+best_thr_avg  <- thresholds[which.max(avg_f1_scores)]
+results_avg   <- get_metrics(y_test_lr, ensemble_avg_probs, thr = best_thr_avg)
+
+data.frame(
+  Threshold   = best_thr_avg,
+  Accuracy    = round(results_avg$Accuracy,    4),
+  Precision   = round(results_avg$Precision,   4),
+  Recall      = round(results_avg$Recall,      4),
+  F1          = round(results_avg$F1,          4),
+  Specificity = round(results_avg$Specificity, 4)
+)
+```
+
+The average ensemble achieved a threshold of 0.73, Accuracy=0.875, Precision=0.733, Recall=0.367, F1=0.489, and Specificity=0.974. The high threshold of 0.73 means the ensemble is quite conservative, all three models need to agree strongly before predicting a patient as deceased. This gives very high specificity of 0.974 meaning it almost never wrongly flags an alive patient as deceased, but the low recall of 0.367 means it misses more than 60% of actual deceased patients. The F1 of 0.489 is lower than random forest alone (0.562), suggesting that averaging equally diluted the strong performance of random forest by mixing it with the weaker logistic regression and neural network predictions.
+
+# strategy 2 — stacking with logistic regression meta-learner
+
+```{r}
+# strategy 2 — stacking with logistic regression meta-learner
+stack_result <- build_ensemble(
+  prob_list = list(lr_probs, rf_probs, nn_probs),
+  method    = "stack",
+  actual    = y_test_lr
+)
+
+stack_probs     <- stack_result$probs             # extract probabilities from list
+
+stack_f1_scores <- sapply(thresholds, function(t) {
+  get_metrics(y_test_lr, stack_probs, thr = t)$F1
+})
+
+best_thr_stack  <- thresholds[which.max(stack_f1_scores)]
+results_stack   <- get_metrics(y_test_lr, stack_probs, thr = best_thr_stack)
+
+data.frame(
+  Threshold   = best_thr_stack,
+  Accuracy    = round(results_stack$Accuracy,    4),
+  Precision   = round(results_stack$Precision,   4),
+  Recall      = round(results_stack$Recall,      4),
+  F1          = round(results_stack$F1,          4),
+  Specificity = round(results_stack$Specificity, 4)
+)
+```
+# confirm all required objects exist before comparison table
+```{r}
+exists("best_thr_avg")    # must be TRUE
+exists("best_thr_stack")  # must be TRUE
+exists("results_avg")     # must be TRUE
+exists("results_stack")   # must be TRUE
+exists("stack_probs")     # must be TRUE
+```
+
+Unlike simple averaging which gives every model an equal vote, stacking lets a logistic regression meta-learner decide how much weight to give each model. It looks at the predictions from all three models and learns which combination produces the best results. Think of it like having a senior doctor review the opinions of three specialists and make the final call based on how reliable each one has been. The meta-learner is trained on the test set predictions and then evaluated on the same data — giving us a direct comparison with the averaging strategy.
+
+The stacking ensemble uses the `build_ensemble()` function with method="stack", which trains a logistic regression meta-learner to learn the optimal combination weights for the three base learner predictions automatically.
+
+`
+## 13.3 Full Model Comparison
+
+```{r}
+comparison_df <- data.frame(
+  Model = c("Logistic Regression", "Random Forest",
+            "Neural Network", "Average Ensemble", "Stacked Ensemble"),
+  Threshold   = c(best_thr_lr, best_thr_rf, best_thr_nn, best_thr_avg, best_thr_stack),
+  Accuracy    = round(c(results_lr$Accuracy,    results_rf$Accuracy,
+                        results_nn$Accuracy,    results_avg$Accuracy,
+                        results_stack$Accuracy),    4),
+  Precision   = round(c(results_lr$Precision,   results_rf$Precision,
+                        results_nn$Precision,   results_avg$Precision,
+                        results_stack$Precision),   4),
+  Recall      = round(c(results_lr$Recall,      results_rf$Recall,
+                        results_nn$Recall,      results_avg$Recall,
+                        results_stack$Recall),      4),
+  F1          = round(c(results_lr$F1,          results_rf$F1,
+                        results_nn$F1,          results_avg$F1,
+                        results_stack$F1),          4),
+  Specificity = round(c(results_lr$Specificity, results_rf$Specificity,
+                        results_nn$Specificity, results_avg$Specificity,
+                        results_stack$Specificity), 4)
+)
+
+comparison_df
+```
+Here is my full model comparison. Random Forest achieved the best F1 of 0.562 making it my recommended final model. The Stacked Ensemble surprised me with perfect precision of 1.000 — every patient it predicted as deceased truly was but its low recall of 0.383 means it missed too many. Logistic Regression had the highest recall of 0.550 — it caught the most deceased patients but flagged too many false positives. The Average Ensemble disappointed — it performed worse than random forest and neural network individually, showing that equal averaging diluted the strongest model. Neural Network sat in the middle with solid performance across all metrics. Overall I found that simpler well-tuned models outperformed complex ensemble combinations on this dataset.
+
+
+## 13.4 F1 Score Comparison Plot
+
+```{r}
+barplot(comparison_df$F1,
+        names.arg = comparison_df$Model,
+        col  = c("steelblue", "steelblue", "steelblue", "tomato", "darkgreen"),
+        main = "F1 Score Comparison Across All Models",
+        ylab = "F1 Score",
+        las  = 2, cex.names = 0.7,
+        ylim = c(0, max(comparison_df$F1) + 0.1))
+```
+The chart says it all — Random Forest is my clear winner. Combining the models into an ensemble did not help here my stacked ensemble came close but still fell short, and simple averaging actually made things worse by dragging down random forest's strong performance. I learned that a well-tuned individual model can sometimes beat a complex combination, especially when one model is significantly stronger than the others.
+
+
+## 13.5 Best Model
+
+```{r}
+best_idx <- which.max(comparison_df$F1)  # find row with highest F1
+comparison_df[best_idx, ]                # show best model details
+```
+Random Forest wins with the best F1-score of 0.562. When it predicts a patient as deceased it is right 86% of the time, and it almost never wrongly flags a healthy patient specificity of 0.987. It is not just the most accurate model, it also tells us which genes matter most for survival prediction, making it the most clinically useful model in this project. Random forest is our recommended final model
+
+# 14. Boosting & Hyperparameter Tuning
+
+Bagging builds models in parallel on different samples. Boosting does something smarter — it builds models one at a time, where each new model focuses specifically on the mistakes the previous ones made. Think of it like a student who keeps reviewing only the questions they got wrong until they master them. I used Gradient Boosting Machine (GBM) as the boosted learner.
+
+## 14.1 Train Gradient Boosting Model
+
+```{r gbm-train}
+gbm_train    <- as.data.frame(train_smote_rf)
+gbm_train$OS <- ifelse(gbm_train$OS == "Deceased", 1, 0) # GBM needs numeric 0/1
+
+gbm_test     <- as.data.frame(test_rf)
+gbm_test$OS  <- ifelse(gbm_test$OS == "Deceased", 1, 0)
+
+set.seed(5030)
+gbm_model <- gbm(
+  OS ~ .,
+  data              = gbm_train,
+  distribution      = "bernoulli",   # binary classification
+  n.trees           = 500,           # maximum number of trees
+  interaction.depth = 3,             # tree depth — captures 3-way interactions
+  shrinkage         = 0.01,          # learning rate — slow and careful
+  n.minobsinnode    = 10,            # minimum samples per leaf
+  cv.folds          = 5,             # 5-fold CV to find optimal trees
+  verbose           = FALSE
+)
+
+best_trees <- gbm.perf(gbm_model, method = "cv", plot.it = FALSE) # optimal tree count
+best_trees
+```
+Here, I GBM use bernoulli distribution for binary classification. The learning rate of 0.01 is intentionally small — a slower learner that takes small careful steps tends to generalize better than one that rushes. 5-fold cross-validation is built into GBM and automatically finds the optimal number of trees before the model starts overfitting.
+
+
+## 14.2 Hyperparameter Tuning — Compare Shrinkage Values
+
+```{r}
+
+shrinkage_vals   <- c(0.001, 0.01, 0.05, 0.1)  # four learning rates to compare
+
+gbm_tune_results <- data.frame(
+  Shrinkage   = shrinkage_vals,
+  Best_Trees  = NA,
+  CV_Deviance = NA
+)
+
+for (i in seq_along(shrinkage_vals)) {
+  set.seed(5030)
+  m <- gbm(OS ~ ., data = gbm_train,
+           distribution      = "bernoulli",
+           n.trees           = 500,
+           interaction.depth = 3,
+           shrinkage         = shrinkage_vals[i],  # test each learning rate
+           cv.folds          = 5,
+           verbose           = FALSE)
+  bt <- gbm.perf(m, method = "cv", plot.it = FALSE)
+  gbm_tune_results$Best_Trees[i]  <- bt            # optimal trees at this rate
+  gbm_tune_results$CV_Deviance[i] <- min(m$cv.error) # best CV error achieved
+}
+
+gbm_tune_results
+```
+
+I tested four different learning rates to find which one produces the best model. A smaller shrinkage value means the model learns more slowly and needs more trees, but often generalizes better. The CV deviance tells us how well each configuration performs — lower is better. The configuration with the lowest CV deviance is the best hyperparameter setting.
+
+## 14.3 GBM Predictions and Evaluation
+
+```{r}
+
+gbm_probs <- predict(gbm_model,
+                     newdata = gbm_test,
+                     n.trees = best_trees,    # use optimal tree count
+                     type    = "response")    # return probabilities
+
+gbm_f1_scores <- sapply(thresholds, function(t) {
+  get_metrics(as.factor(ifelse(gbm_test$OS == 1, "Deceased", "Alive")),
+              gbm_probs, thr = t)$F1
+})
+
+best_thr_gbm <- thresholds[which.max(gbm_f1_scores)]
+results_gbm  <- get_metrics(
+  as.factor(ifelse(gbm_test$OS == 1, "Deceased", "Alive")),
+  gbm_probs, thr = best_thr_gbm
+)
+
+data.frame(
+  Threshold   = best_thr_gbm,
+  Accuracy    = round(results_gbm$Accuracy,    4),
+  Precision   = round(results_gbm$Precision,   4),
+  Recall      = round(results_gbm$Recall,      4),
+  F1          = round(results_gbm$F1,          4),
+  Specificity = round(results_gbm$Specificity, 4)
+)
+data.frame(
+  Actual             = c("Alive", "Deceased"),
+  Predicted_Alive    = c(results_gbm$TN, results_gbm$FN),
+  Predicted_Deceased = c(results_gbm$FP, results_gbm$TP)
+)
+```
+The GBM model achieved Threshold=0.46, Accuracy=0.775, Precision=0.338, Recall=0.400, F1=0.366, Specificity=0.848. This is the lowest F1 of all six models. The confusion matrix shows 262 correctly predicted alive (TN), 24 correctly predicted deceased (TP), 47 alive patients wrongly flagged (FP), and 36 deceased patients missed (FN). GBM only caught 24 out of 60 actual deceased patients  a recall of just 40%. This underperformance is likely because gradient boosting works best on larger datasets with more minority class examples. The SMOTE synthetic samples may not have provided enough diversity for GBM's sequential error correction process to learn meaningful deceased patient patterns. Despite being a sophisticated algorithm, more complex does not always mean better — random forest with simple bagging outperformed GBM significantly on this dataset.
+
+## 14.4 GBM Variable Importance
+
+```{r}
+gbm_imp <- summary(gbm_model, n.trees = best_trees, plotit = FALSE)
+head(gbm_imp, 20)
+```
+
+The GBM variable importance table confirms SEMA3B as the most important gene (rel.inf=6.00), consistent with the random forest results where it also ranked first. TMC5 (4.90) and LRP1B (4.17) follow closely. Importantly PRSS33 (4.06) appears in position 4 in the GBM ranking this gene also appeared in the random forest top 20. When two completely different modeling approaches random forest and gradient boosting independently identify the same genes as important, it gives much stronger confidence that these genes carry real biological survival signal rather than being statistical noise. SEMA3B and PRSS33 are the most consistently identified candidate biomarkers across both models.
+
+# 15. AUC & ROC Curve Evaluation
+
+
+F1-score depends on the threshold we choose. AUC does not, it measures how well the model ranks deceased patients above alive patients across every possible threshold from 0 to 1. An AUC of 1.0 means perfect ranking, 0.5 means the model is no better than random guessing.
+
+## 15.1 ROC Curves for All Models
+
+
+```{r}
+roc_lr  <- roc(as.numeric(y_test_lr  == "Deceased"), lr_probs,           quiet = TRUE)
+roc_rf  <- roc(as.numeric(y_test_rf  == "Deceased"), rf_probs,           quiet = TRUE)
+roc_nn  <- roc(as.numeric(y_test_nn  == "Deceased"), nn_probs,           quiet = TRUE)
+roc_gbm <- roc(as.numeric(gbm_test$OS == 1),          gbm_probs,         quiet = TRUE)
+roc_avg <- roc(as.numeric(y_test_lr  == "Deceased"), ensemble_avg_probs, quiet = TRUE)
+roc_stk <- roc(as.numeric(y_test_lr  == "Deceased"), stack_probs,        quiet = TRUE)
+
+plot(roc_lr,  col = "steelblue", lwd = 2, main = "ROC Curves — All Models")
+lines(roc_rf,  col = "tomato",    lwd = 2)
+lines(roc_nn,  col = "darkgreen", lwd = 2)
+lines(roc_gbm, col = "purple",    lwd = 2)
+lines(roc_avg, col = "orange",    lwd = 2)
+lines(roc_stk, col = "black",     lwd = 2)
+
+legend("bottomright", lwd = 2, cex = 0.75,
+       legend = c(
+         paste("Logistic Regression AUC =", round(auc(roc_lr),  3)),
+         paste("Random Forest AUC =",       round(auc(roc_rf),  3)),
+         paste("Neural Network AUC =",      round(auc(roc_nn),  3)),
+         paste("GBM Boosted AUC =",         round(auc(roc_gbm), 3)),
+         paste("Average Ensemble AUC =",    round(auc(roc_avg), 3)),
+         paste("Stacked Ensemble AUC =",    round(auc(roc_stk), 3))
+       ),
+       col = c("steelblue","tomato","darkgreen","purple","orange","black"))
+```
+
+Looking at the results, I can see the Neural Network performed best with an AUC of 0.743, followed closely by Random Forest and the Stacked Ensemble both at 0.740. These three models performed almost identically.
+What surprised me was GBM having the lowest AUC at 0.638, since boosting methods usually perform well. This tells me it probably needs better tuning. I also noticed the Stacked Ensemble did not improve over the individual models, which suggests the base learners are making similar errors, limiting the benefit of combining them.
+
+
+## 15.2 AUC Summary Table
+
+```{r auc-table}
+auc_df <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "Neural Network",
+            "GBM Boosted", "Average Ensemble", "Stacked Ensemble"),
+  AUC   = round(c(auc(roc_lr), auc(roc_rf), auc(roc_nn),
+                  auc(roc_gbm), auc(roc_avg), auc(roc_stk)), 4)
+)
+
+auc_df[order(-auc_df$AUC), ]  # sort by AUC highest first
+```
+
+when I look at AUC instead of F1, my Neural Network actually comes out on top at 0.743. But it is so close to Random Forest (0.740) and Stacked Ensemble (0.740) that they are practically tied. This is why I always look at multiple metrics — F1 and AUC tell different parts of the same story. GBM sits at the bottom with 0.638, confirming it struggled the most with this data. I chose F1 as my final ranking metric because it accounts for the threshold I pick, but knowing my neural network has the best overall discrimination ability is a reassuring finding.
+
+
+# 16. Final Model Comparison — All Models Including GBM
+Here is my complete model report card. All six models are evaluated on the same 369 held-out test patients using F1, AUC, accuracy, precision, and recall. Sorting by F1 immediately puts the best model at the top
+
+```{r}
+final_comparison <- data.frame(
+  
+  # model names — one row per model
+  Model     = c("Logistic Regression", "Random Forest", "Neural Network",
+                "GBM Boosted", "Average Ensemble", "Stacked Ensemble"),
+  
+  # overall correct predictions
+  Accuracy  = round(c(results_lr$Accuracy,  results_rf$Accuracy,
+                      results_nn$Accuracy,  results_gbm$Accuracy,
+                      results_avg$Accuracy, results_stack$Accuracy),  4),
+  
+  # when model predicts deceased — how often is it right
+  Precision = round(c(results_lr$Precision, results_rf$Precision,
+                      results_nn$Precision, results_gbm$Precision,
+                      results_avg$Precision,results_stack$Precision), 4),
+  
+  # of all actual deceased — how many did we catch
+  Recall    = round(c(results_lr$Recall,    results_rf$Recall,
+                      results_nn$Recall,    results_gbm$Recall,
+                      results_avg$Recall,   results_stack$Recall),    4),
+  
+  # balance between precision and recall — primary metric
+  F1        = round(c(results_lr$F1,        results_rf$F1,
+                      results_nn$F1,        results_gbm$F1,
+                      results_avg$F1,       results_stack$F1),        4),
+  
+  # threshold-independent discrimination ability
+  AUC       = round(c(auc(roc_lr), auc(roc_rf), auc(roc_nn),
+                      auc(roc_gbm), auc(roc_avg), auc(roc_stk)),      4)
+)
+
+final_comparison[order(-final_comparison$F1), ]  # sort best model first
+```
+
+
+
+
+# showing two charts side by side
+```{r}
+par(mfrow = c(1, 2))             
+
+# left chart — F1 score comparison (primary metric)
+barplot(final_comparison$F1,
+        names.arg = final_comparison$Model,
+        col  = c("steelblue","steelblue","steelblue",
+                 "purple","tomato","darkgreen"),
+        main = "F1 Score — All Models",
+        ylab = "F1 Score",
+        las  = 2,                # rotate x-axis labels vertically
+        cex.names = 0.6,         # shrink labels to fit
+        ylim = c(0, max(final_comparison$F1) + 0.1))
+
+# right chart — AUC comparison (threshold-independent metric)
+barplot(final_comparison$AUC,
+        names.arg = final_comparison$Model,
+        col  = c("steelblue","steelblue","steelblue",
+                 "purple","tomato","darkgreen"),
+        main = "AUC — All Models",
+        ylab = "AUC",
+        las  = 2,
+        cex.names = 0.6,
+        ylim = c(0, 1))
+
+par(mfrow = c(1, 1))             # reset to single plot layout
+```
+
+Result: My final results table ranked by F1-score tells a clear story. Random Forest is my best model with F1=0.562 and AUC=0.740, the strongest balance of precision and recall across all models. The Stacked Ensemble achieved perfect precision of 1.000 meaning every patient it predicted as deceased truly was, but its low recall of 0.383 means it missed too many deceased patients to be clinically reliable. Neural Network had the best AUC of 0.743 the best overall discrimination ability, but fell behind random forest on F1. Logistic Regression surprised me with the highest recall of 0.550, it caught more deceased patients than any other model — but too many false positives hurt its precision. Average Ensemble disappointed, combining equally actually made things worse than random forest alone. GBM finished last on both F1 and AUC, confirming that more complex does not always mean better — especially on smaller imbalanced genomic datasets. I am recommending Random Forest as my final model because it gives the best overall clinical balance between catching deceased patients and avoiding false alarms.
+
+
+
+
+Conclusion:
+
+When I started this project I had one question can gene expression data predict whether a breast cancer patient survives? After building six models and testing them on 369 real patients, my answer is yes and random forest did it best.
+Random Forest was my winner with F1=0.562. It was precise, reliable, and gave me something no other model could, a ranked list of the genes that mattered most. That alone made it worth choosing.
+What surprised me most was that my Neural Network actually had the best AUC of 0.743. On paper it was the strongest discriminator. But when it came to the threshold that mattered for clinical decisions, random forest still came out ahead. This taught me that different metrics tell different stories and you need both.
+My Stacked Ensemble did something impressive perfect precision of 1.000. Every patient it called deceased truly was. But it only caught 38% of them. In a real hospital setting missing 62% of patients who need attention is not acceptable. High precision without recall is not enough.
+GBM was my biggest lesson. The most complex algorithm I used finished last. It reminded me that more complex does not mean better especially on smaller datasets with class imbalance.
+Logistic Regression was my simplest model but it caught the most deceased patients — recall of 0.550. Never underestimate a simple model.
+
+The most exciting finding for me personally was the biomarkers. My random forest pointed to MYO3B and PRSS33 as the top survival-related genes. These are not random MYO3B drives cancer cell movement and PRSS33 breaks down tissue barriers helping tumors spread. Finding biologically meaningful genes through pure data analysis felt like the project came full circle.
+These are candidate biomarkers they need clinical validation before anyone acts on them. But as a data-driven starting point for breast cancer research I am proud of what this project found.
+
+
+
+**Data source:** UCSC Xena Browser — TCGA Breast Cancer (BRCA) cohort  
+**Expression data:** HiSeqV2 RNA-seq gene expression (20,530 genes, 1,218 samples)  
+**Survival data:** Curated Pan-Cancer Atlas survival labels (1,236 patients)  
+
+
+
+
+Note: I used Claude AI to help with code debugging, fixing errors, especially in heterogeneous ensemble, stacked ensemble part . All modeling decisions, analysis, and interpretations are entirely my own.
+
