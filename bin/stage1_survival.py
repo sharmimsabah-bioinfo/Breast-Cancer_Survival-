@@ -57,7 +57,7 @@ import xgboost as xgb
 
 warnings.filterwarnings("ignore")
 
-# Reproducibility — same seed as your R project
+# Reproducibility — same seed as my R project
 SEED = 5030
 random.seed(SEED)
 np.random.seed(SEED)
@@ -71,7 +71,7 @@ print(f"Device: {DEVICE}")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1  DATA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 3 — loads directly from UCSC Xena (same URLs)
+# Mirrors my R Section 3 — loads directly from UCSC Xena (same URLs)
 
 print("\n" + "="*60)
 print("SECTION 1: DATA LOADING")
@@ -86,7 +86,7 @@ print("Loading gene expression matrix (20,530 genes × 1,218 patients)...")
 expr_raw = pd.read_csv(URL_EXPR, sep="\t", index_col=0)
 print(f"  Raw expression shape : {expr_raw.shape}")  # (20530, 1218)
 
-# Transpose — same as your t(expr_mat): patients → rows, genes → columns
+# Transpose — same as my t(expr_mat): patients → rows, genes → columns
 expr = expr_raw.T.copy()
 print(f"  After transpose       : {expr.shape}")      # (1218, 20530)
 
@@ -99,7 +99,7 @@ print(surv[["sample", "OS", "OS.time"]].head(3).to_string())
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2  DATA CLEANING & MERGING
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 4 — same logic, same patient counts expected
+# Mirrors R Section 4 — same logic, same patient counts expected
 
 print("\n" + "="*60)
 print("SECTION 2: DATA CLEANING")
@@ -112,7 +112,7 @@ print(f"  Sample type counts:\n{sample_codes.value_counts().to_string()}")
 expr = expr[sample_codes == "01"]
 print(f"  After keeping tumors (01): {expr.shape}")  # expect ~1,097 × 20,530
 
-# Trim patient IDs to 12 chars to match survival file (same as your str_sub)
+# Trim patient IDs to 12 chars to match survival file (same as  str_sub)
 expr.index = expr.index.str[:12]
 expr = expr[~expr.index.duplicated(keep="first")]
 
@@ -127,7 +127,7 @@ print(f"  Class distribution:\n{surv_clean['OS'].value_counts().to_string()}")
 surv_clean = surv_clean.drop_duplicates(subset="patient_id", keep="first")
 surv_indexed = surv_clean.set_index("patient_id")
 
-# Deduplicate expr index too (same as your distinct() in R)
+# Deduplicate expr index too (same as my distinct() in R)
 expr = expr[~expr.index.duplicated(keep="first")]
 
 # Join — only patients present in both
@@ -145,7 +145,7 @@ print(f"  ✓ expr and y aligned: {len(y)} patients")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3  MISSING VALUE IMPUTATION
 # ─────────────────────────────────────────────────────────────────────────────
-# Same logic as your R Section 4.5 — median imputation per gene
+# Same logic as my R Section 4.5 — median imputation per gene
 
 print("\n" + "="*60)
 print("SECTION 3: IMPUTATION")
@@ -163,26 +163,26 @@ print(f"  Shape after imputation: {expr.shape} — y still {len(y)} labels ✓")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4  EXPLORATORY DATA ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 5 — same analyses, now in matplotlib/seaborn
+# Mirrors my R Section 5 — same analyses, now in matplotlib/seaborn
 
 print("\n" + "="*60)
 print("SECTION 4: EXPLORATORY DATA ANALYSIS")
 print("="*60)
 
-# 4.1 Class distribution bar chart (replaces your barplot)
+# 4.1 Class distribution bar chart (replaces my barplot)
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 pd.Series(y).value_counts().rename({0: "Alive", 1: "Deceased"}).plot(
     kind="bar", ax=axes[0], color=["steelblue", "tomato"],
     title="Class Distribution\n(83.6% alive, 16.4% deceased)")
 axes[0].set_ylabel("Count"); axes[0].tick_params(rotation=0)
 
-# 4.2 Variance distribution across all genes (mirrors your hist(gene_vars))
+# 4.2 Variance distribution across all genes (mirrors my hist(gene_vars))
 gene_vars = expr.var(axis=0)
 axes[1].hist(gene_vars, bins=50, color="steelblue", edgecolor="white")
 axes[1].set_title("Gene Variance Distribution\n(20,530 genes)")
 axes[1].set_xlabel("Variance"); axes[1].set_ylabel("Frequency")
 
-# 4.3 Expression distributions for top 6 genes (mirrors your par(mfrow=c(2,3)))
+# 4.3 Expression distributions for top 6 genes (mirrors my par(mfrow=c(2,3)))
 top6 = gene_vars.nlargest(6).index
 expr[top6].plot(kind="box", ax=axes[2],
                 title="Top 6 Variable Genes\nExpression Distribution")
@@ -192,7 +192,7 @@ plt.savefig("eda_overview.png", dpi=100, bbox_inches="tight")
 plt.close()
 print("  Saved: eda_overview.png")
 
-# 4.4 Correlation heatmap — top 20 genes (mirrors your image(cor_mat))
+# 4.4 Correlation heatmap — top 20 genes (mirrors my image(cor_mat))
 top20 = gene_vars.nlargest(20).index
 corr_mat = expr[top20].corr()
 plt.figure(figsize=(10, 8))
@@ -205,7 +205,7 @@ plt.close()
 print("  Saved: correlation_heatmap.png")
 print("  Note: Most genes show low pairwise correlation — no PCA needed")
 
-# 4.5 Outlier detection (mirrors your z-score analysis)
+# 4.5 Outlier detection (mirrors my z-score analysis)
 z_scores = (expr[top20] - expr[top20].mean()) / expr[top20].std()
 outlier_counts = (z_scores.abs() > 3).sum()
 outlier_pct = outlier_counts.sum() / (len(expr) * 20) * 100
@@ -216,18 +216,18 @@ print(f"  That's {outlier_pct:.2f}% of values — keeping all (biological signal
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5  FEATURE SELECTION & PREPROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 7 — same 2,000→200 variance filter
+# Mirrors my R Section 7 — same 2,000→200 variance filter
 
 print("\n" + "="*60)
 print("SECTION 5: FEATURE SELECTION & PREPROCESSING")
 print("="*60)
 
-# Step 1: Top 2,000 by variance (same as your keep <- order(vars)[1:2000])
+# Step 1: Top 2,000 by variance (same as my keep <- order(vars)[1:2000])
 top2000_idx = gene_vars.nlargest(2000).index
 X_2000 = expr[top2000_idx].values
 print(f"  Top 2,000 genes shape: {X_2000.shape}")
 
-# Step 2: Top 200 by variance (same as your final top200_idx)
+# Step 2: Top 200 by variance (same as my final top200_idx)
 gene_vars_2000 = pd.Series(gene_vars[top2000_idx].values, index=top2000_idx)
 top200_idx = gene_vars_2000.nlargest(200).index
 X_final    = expr[top200_idx].values
@@ -245,7 +245,7 @@ print(f"\n  Log-ratio {g1}/{g2}: mean={log_ratio.mean():.3f}, "
 X_with_ratio = np.hstack([X_final, log_ratio.reshape(-1, 1)])
 print(f"  Feature matrix with log ratio: {X_with_ratio.shape}")
 
-# Step 4: Scale (same as your scale() — StandardScaler = zero-mean, unit-var)
+# Step 4: Scale (same as my scale() — StandardScaler = zero-mean, unit-var)
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X_final)         # for LR, MLP (neural net)
 X_unscaled = X_final.copy()                       # for RF, XGB (tree-based)
@@ -256,7 +256,7 @@ print(f"  Scaled std   (should be ~1): {X_scaled.std():.4f}")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 6  TRAIN/TEST SPLIT & SMOTE
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 8 — 70/30 stratified split then SMOTE on train only
+# Mirrors my R Section 8 — 70/30 stratified split then SMOTE on train only
 
 print("\n" + "="*60)
 print("SECTION 6: TRAIN/TEST SPLIT & SMOTE")
@@ -273,7 +273,7 @@ print(f"  Train: {X_train_s.shape[0]} patients "
 print(f"  Test : {X_test_s.shape[0]} patients "
       f"(Alive: {(y_test==0).sum()}, Deceased: {(y_test==1).sum()})")
 
-# SMOTE — only on training set (same as your smotefamily::SMOTE with K=5)
+# SMOTE — only on training set (same as my smotefamily::SMOTE with K=5)
 smote = SMOTE(k_neighbors=5, random_state=SEED)
 X_train_bal_s, y_train_bal = smote.fit_resample(X_train_s, y_train)
 X_train_bal_u, _           = smote.fit_resample(X_train_u, y_train)
@@ -281,17 +281,17 @@ X_train_bal_u, _           = smote.fit_resample(X_train_u, y_train)
 print(f"\n  After SMOTE:")
 print(f"  Train: {X_train_bal_s.shape[0]} patients "
       f"(Alive: {(y_train_bal==0).sum()}, Deceased: {(y_train_bal==1).sum()})")
-# ➜ Expect ~722 Alive / ~710 Deceased — matches your R output
+# ➜ Expect ~722 Alive / ~710 Deceased — matches my R output
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 7  HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your get_metrics() function — same metrics, same threshold tuning
+# Mirrors my get_metrics() function — same metrics, same threshold tuning
 
 def get_metrics(y_true, y_probs, threshold=0.5):
     """
-    Mirrors your R get_metrics() function exactly.
+    Mirrors my R get_metrics() function exactly.
     Returns Accuracy, Precision, Recall, F1, Specificity, and confusion counts.
     """
     y_pred = (y_probs >= threshold).astype(int)
@@ -310,7 +310,7 @@ def get_metrics(y_true, y_probs, threshold=0.5):
 
 def find_best_threshold(y_true, y_probs, thresholds=None):
     """
-    Mirrors your threshold tuning loop (seq(0.05, 0.95, by=0.01)).
+    Mirrors my threshold tuning loop (seq(0.05, 0.95, by=0.01)).
     Returns the threshold that maximises F1 on y_true.
     """
     if thresholds is None:
@@ -323,7 +323,7 @@ def find_best_threshold(y_true, y_probs, thresholds=None):
     return best_thr, best_f1
 
 def plot_f1_by_threshold(y_true, y_probs, title, best_thr):
-    """Mirrors your plot(thresholds, f1_scores) + abline(v=best_thr)"""
+    """Mirrors my plot(thresholds, f1_scores) + abline(v=best_thr)"""
     thresholds = np.arange(0.05, 0.96, 0.01)
     f1s = [get_metrics(y_true, y_probs, t)["F1"] for t in thresholds]
     plt.figure(figsize=(7, 3))
@@ -340,7 +340,7 @@ def plot_f1_by_threshold(y_true, y_probs, title, best_thr):
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 8  CLUSTERING EXPLORATION
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 6 — k-means on top 50 genes
+# Mirrors my R Section 6 — k-means on top 50 genes
 
 print("\n" + "="*60)
 print("SECTION 8: CLUSTERING EXPLORATION")
@@ -351,7 +351,7 @@ from sklearn.preprocessing import StandardScaler as SS
 
 X_cluster = SS().fit_transform(X_scaled[:, :50])  # top 50 genes, scaled
 
-# Elbow plot (mirrors your wss plot, k=2 to k=8)
+# Elbow plot (mirrors my wss plot, k=2 to k=8)
 inertias = []
 ks = range(2, 9)
 for k in ks:
@@ -366,12 +366,12 @@ plt.title("Elbow Plot — K-Means on Top 50 Genes")
 plt.tight_layout(); plt.savefig("elbow_plot.png", dpi=100); plt.close()
 print("  Saved: elbow_plot.png")
 
-# k=3 final clustering (matches your kmeans result)
+# k=3 final clustering (matches my kmeans result)
 km3 = KMeans(n_clusters=3, n_init=25, random_state=SEED)
 clusters = km3.fit_predict(X_cluster)
 print(f"\n  Cluster sizes: {np.bincount(clusters)}")
 
-# Survival × cluster cross-tab (matches your prop.table)
+# Survival × cluster cross-tab (matches my prop.table)
 for c in range(3):
     mask = clusters == c
     alive_pct = (y[mask] == 0).mean() * 100
@@ -384,13 +384,13 @@ for c in range(3):
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 9  MODEL 1 — LOGISTIC REGRESSION (Bagged Ensemble)
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 10 — same B=10 bagging, same threshold tuning
+# Mirrors my R Section 10 — same B=10 bagging, same threshold tuning
 
 print("\n" + "="*60)
 print("SECTION 9: MODEL 1 — LOGISTIC REGRESSION (Bagged Ensemble)")
 print("="*60)
 
-B = 10  # number of bootstrap models (same as your R code)
+B = 10  # number of bootstrap models (same as my R code)
 n_train = len(X_train_bal_s)
 
 lr_models = []
@@ -415,7 +415,7 @@ print(f"\n  Best threshold: {best_thr_lr:.2f}")
 print(f"  Accuracy  : {results_lr['Accuracy']:.4f}")
 print(f"  Precision : {results_lr['Precision']:.4f}")
 print(f"  Recall    : {results_lr['Recall']:.4f}   ← best recall of all models")
-print(f"  F1        : {results_lr['F1']:.4f}  (your R: 0.465)")
+print(f"  F1        : {results_lr['F1']:.4f}  (my R: 0.465)")
 print(f"  Specificity: {results_lr['Specificity']:.4f}")
 print(f"\n  Confusion matrix:")
 print(f"           Pred Alive  Pred Deceased")
@@ -425,7 +425,7 @@ print(f"  Deceased:   {results_lr['FN']:4d}          {results_lr['TP']:4d}")
 plot_f1_by_threshold(y_test, lr_probs, "Logistic Regression F1 by Threshold",
                      best_thr_lr)
 
-# 5-fold cross validation (mirrors your trainControl with method="cv", number=5)
+# 5-fold cross validation (mirrors my trainControl with method="cv", number=5)
 skf_lr = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 lr_cv_aucs = []
 for fold, (tr, va) in enumerate(skf_lr.split(X_train_bal_s, y_train_bal)):
@@ -435,7 +435,7 @@ for fold, (tr, va) in enumerate(skf_lr.split(X_train_bal_s, y_train_bal)):
                             lr_cv.predict_proba(X_train_bal_s[va])[:, 1])
     lr_cv_aucs.append(auc_cv)
 print(f"\n  5-Fold CV AUC: {np.mean(lr_cv_aucs):.3f} ± {np.std(lr_cv_aucs):.3f}")
-print(f"  (Your R result: AUC=0.820)")
+print(f"  (my R result: AUC=0.820)")
 auc_lr = roc_auc_score(y_test, lr_probs)
 print(f"  Test AUC: {auc_lr:.4f}")
 
@@ -443,7 +443,7 @@ print(f"  Test AUC: {auc_lr:.4f}")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 10  MODEL 2 — RANDOM FOREST (Bagged Ensemble)
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 11 — ntree=200, mtry=sqrt(p), B=10 bags
+# Mirrors my R Section 11 — ntree=200, mtry=sqrt(p), B=10 bags
 
 print("\n" + "="*60)
 print("SECTION 10: MODEL 2 — RANDOM FOREST (Bagged Ensemble)")
@@ -469,11 +469,11 @@ rf_probs = np.mean([m.predict_proba(X_test_u)[:, 1] for m in rf_models], axis=0)
 best_thr_rf, _ = find_best_threshold(y_test, rf_probs)
 results_rf = get_metrics(y_test, rf_probs, best_thr_rf)
 
-print(f"\n  Best threshold: {best_thr_rf:.2f}  (your R: 0.49)")
-print(f"  F1       : {results_rf['F1']:.4f}  ← BEST single model (your R: 0.562)")
-print(f"  Precision: {results_rf['Precision']:.4f}  (your R: 0.860)")
-print(f"  Recall   : {results_rf['Recall']:.4f}  (your R: 0.433)")
-print(f"  AUC      : {roc_auc_score(y_test, rf_probs):.4f}  (your R: 0.740)")
+print(f"\n  Best threshold: {best_thr_rf:.2f}  (my R: 0.49)")
+print(f"  F1       : {results_rf['F1']:.4f}  ← BEST single model (my R: 0.562)")
+print(f"  Precision: {results_rf['Precision']:.4f}  (my R: 0.860)")
+print(f"  Recall   : {results_rf['Recall']:.4f}  (my R: 0.433)")
+print(f"  AUC      : {roc_auc_score(y_test, rf_probs):.4f}  (my R: 0.740)")
 
 plot_f1_by_threshold(y_test, rf_probs, "Random Forest F1 by Threshold",
                      best_thr_rf)
@@ -486,9 +486,9 @@ imp_df = imp_df.sort_values("Importance", ascending=False).reset_index(drop=True
 
 print(f"\n  Top 10 genes by MeanDecreaseGini:")
 print(imp_df.head(10).to_string(index=False))
-print(f"  #1 gene: {imp_df.iloc[0]['Gene']} (matches your R: SEMA3B)")
+print(f"  #1 gene: {imp_df.iloc[0]['Gene']} (matches my R: SEMA3B)")
 
-# Bar chart — top 20 genes (mirrors your barplot)
+# Bar chart — top 20 genes (mirrors my barplot)
 plt.figure(figsize=(10, 4))
 plt.bar(range(20), imp_df["Importance"][:20], color="steelblue")
 plt.xticks(range(20), imp_df["Gene"][:20], rotation=45, ha="right", fontsize=8)
@@ -509,20 +509,20 @@ for tr, va in skf_rf.split(X_train_bal_u, y_train_bal):
     rf_cv_aucs.append(roc_auc_score(y_train_bal[va],
                                      rf_cv.predict_proba(X_train_bal_u[va])[:, 1]))
 print(f"\n  5-Fold CV AUC: {np.mean(rf_cv_aucs):.3f} ± {np.std(rf_cv_aucs):.3f}")
-print(f"  (Your R result: AUC=0.995 at best mtry — outstanding)")
+print(f"  (my R result: AUC=0.995 at best mtry — outstanding)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 11  MODEL 3 — DEEP MLP (PyTorch) — UPGRADE FROM R's nnet
 # ─────────────────────────────────────────────────────────────────────────────
-# Your R nnet had: 200 inputs → 5 hidden nodes → 1 output (MaxNWts=2000)
+# my R nnet had: 200 inputs → 5 hidden nodes → 1 output (MaxNWts=2000)
 # This PyTorch MLP has: 200 → 512 → 256 → 64 → 1 (BatchNorm + Dropout)
-# This is the most direct "rebuild in PyTorch" of your Section 12.
+# This is the most direct "rebuild in PyTorch" of my Section 12.
 
 print("\n" + "="*60)
 print("SECTION 11: MODEL 3 — DEEP MLP (PyTorch upgrade from nnet)")
 print("="*60)
-print("  Your R nnet: 200 → 5 → 1 (5 hidden nodes, weight decay=0.01)")
+print("  my R nnet: 200 → 5 → 1 (5 hidden nodes, weight decay=0.01)")
 print("  PyTorch MLP: 200 → 512 → 256 → 64 → 1 (BatchNorm + Dropout)")
 
 class SurvivalMLP(nn.Module):
@@ -569,18 +569,18 @@ X_te_t = torch.FloatTensor(X_test_s)
 train_ds = TensorDataset(X_tr_t, y_tr_t)
 train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
 
-# Train single MLP (equivalent to one model in your B=10 loop)
+# Train single MLP (equivalent to one model in R B=10 loop)
 mlp = SurvivalMLP(input_dim=200).to(DEVICE)
 optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-3, weight_decay=1e-4)
 # Focal loss — handles class imbalance better than BCE
-# (upgrade from your nnet's plain MSE)
+# (upgrade from my nnet's plain MSE)
 def focal_bce(pred, target, gamma=2.0, alpha=0.75):
     bce = F.binary_cross_entropy(pred, target, reduction="none")
     pt  = torch.exp(-bce)
     return (alpha * (1 - pt) ** gamma * bce).mean()
 
 print(f"\n  Parameters: {sum(p.numel() for p in mlp.parameters()):,}")
-print(f"  (Your R nnet had ~{200*5 + 5 + 5 + 1} = ~1,006 parameters)")
+print(f"  (my R nnet had ~{200*5 + 5 + 5 + 1} = ~1,006 parameters)")
 print(f"  Training for 50 epochs...")
 
 train_losses, val_aucs = [], []
@@ -607,7 +607,7 @@ for epoch in range(50):
         print(f"  Epoch {epoch+1:3d} | Loss: {ep_loss/len(train_dl):.4f} | "
               f"Val AUC: {val_auc:.4f}")
 
-# Bagged ensemble — B=10 MLPs (same logic as your B=10 nnet loop)
+# Bagged ensemble — B=10 MLPs (same logic as my B=10 nnet loop)
 mlp_probs_list = []
 print(f"\n  Training bagged ensemble ({B} MLPs)...")
 for i in range(B):
@@ -641,8 +641,8 @@ results_nn = get_metrics(y_test, nn_probs, best_thr_nn)
 auc_nn = roc_auc_score(y_test, nn_probs)
 
 print(f"\n  Best threshold: {best_thr_nn:.2f}")
-print(f"  F1       : {results_nn['F1']:.4f}  (your R nnet: 0.51)")
-print(f"  AUC      : {auc_nn:.4f}   (your R nnet: 0.743)")
+print(f"  F1       : {results_nn['F1']:.4f}  (my R nnet: 0.51)")
+print(f"  AUC      : {auc_nn:.4f}   (my R nnet: 0.743)")
 print(f"  Precision: {results_nn['Precision']:.4f}")
 print(f"  Recall   : {results_nn['Recall']:.4f}")
 
@@ -653,14 +653,14 @@ plot_f1_by_threshold(y_test, nn_probs, "Deep MLP (PyTorch) F1 by Threshold",
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 12  MODEL 4 — XGBOOST (upgrade from GBM)
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 14 — GBM with shrinkage tuning
+# Mirrors my R Section 14 — GBM with shrinkage tuning
 # XGBoost is a faster, better-regularized implementation of the same idea
 
 print("\n" + "="*60)
 print("SECTION 12: MODEL 4 — XGBOOST (upgrade from R GBM)")
 print("="*60)
 
-# Hyperparameter tuning — mirrors your shrinkage_vals comparison
+# Hyperparameter tuning — mirrors my shrinkage_vals comparison
 lr_vals = [0.001, 0.01, 0.05, 0.1]
 xgb_tune_results = []
 for lr_val in lr_vals:
@@ -694,21 +694,21 @@ results_xgb = get_metrics(y_test, xgb_probs, best_thr_xgb)
 auc_xgb = roc_auc_score(y_test, xgb_probs)
 
 print(f"\n  XGBoost results:")
-print(f"  F1  : {results_xgb['F1']:.4f}  (your R GBM: 0.366 — expect improvement)")
-print(f"  AUC : {auc_xgb:.4f}   (your R GBM: 0.638)")
+print(f"  F1  : {results_xgb['F1']:.4f}  (my R GBM: 0.366 — expect improvement)")
+print(f"  AUC : {auc_xgb:.4f}   (my R GBM: 0.638)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 13  ESM-2 GENE EMBEDDINGS — FLAGSHIP PI UPGRADE
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — not in your R project.
-# Each of your top 200 genes gets a 1280-dim embedding from ESM-2
+# NEW — not in my R project.
+# Each of my top 200 genes gets a 1280-dim embedding from ESM-2
 # encoding what the gene's protein DOES biologically (not just expression level)
 
 print("\n" + "="*60)
 print("SECTION 13: ESM-2 GENE EMBEDDINGS (Flagship PI upgrade)")
 print("="*60)
-print("  Your R project: raw expression values only")
+print("  my R project: raw expression values only")
 print("  Upgrade: each gene also gets a 1280-dim protein language model embedding")
 print("  This encodes evolutionary conservation, functional domains, structure")
 
@@ -745,7 +745,7 @@ def get_gene_embedding(protein_seq: str) -> torch.Tensor:
     emb = out["representations"][33][0, 1:-1]  # strip BOS/EOS
     return emb.mean(0)                          # [1280] mean-pooled
 
-# Get protein sequences for your top 200 genes via UniProt API
+# Get protein sequences for my top 200 genes via UniProt API
 from bioservices import UniProt
 u = UniProt()
 gene_embeddings = {}
@@ -757,7 +757,7 @@ for gene in top200_genes:
         gene_embeddings[gene] = get_gene_embedding(seq)
 
 # Result: dict of {gene_name: 1280-dim tensor}
-# Your top gene SEMA3B gets a 1280-dim vector encoding:
+# my top gene SEMA3B gets a 1280-dim vector encoding:
 # - It's a class 3 semaphorin with a sema domain
 # - Evolutionary conservation across vertebrates
 # - Structural similarity to other tumor suppressors
@@ -782,14 +782,14 @@ print(f"  (Real ESM-2 embeddings would be [200, 1280] — 40x richer)")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 14  GNN ENCODER — GENE CO-EXPRESSION GRAPH
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — not in your R project.
+# NEW — not in my R project.
 # Models gene-gene interactions explicitly via graph attention network.
 # Each patient = a graph of 200 gene nodes + co-expression edges.
 
 print("\n" + "="*60)
 print("SECTION 14: GNN — GENE CO-EXPRESSION GRAPH")
 print("="*60)
-print("  Your R project: all 200 genes treated as independent features")
+print(" my R project: all 200 genes treated as independent features")
 print("  Upgrade: GNN models SEMA3B ↔ LRP1B interactions explicitly")
 
 # Build gene co-expression graph (correlation > 0.5)
@@ -891,14 +891,14 @@ print("\n  [To run: pip install torch_geometric, then uncomment the GNN block]")
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 15  ENSEMBLE — AVERAGE + STACKING + RL POLICY
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 13, then upgrades stacking to RL policy
-# Your R results: Average Ensemble F1=0.489, Stacked Ensemble precision=1.0
+# Mirrors my R Section 13, then upgrades stacking to RL policy
+# my R results: Average Ensemble F1=0.489, Stacked Ensemble precision=1.0
 
 print("\n" + "="*60)
 print("SECTION 15: ENSEMBLE — Average + Stacking + RL Policy")
 print("="*60)
 
-# Strategy 1: Simple average (same as your build_ensemble(method="average"))
+# Strategy 1: Simple average (same as my build_ensemble(method="average"))
 ensemble_avg_probs = np.mean([lr_probs, rf_probs, nn_probs], axis=0)
 best_thr_avg, _ = find_best_threshold(y_test, ensemble_avg_probs)
 results_avg = get_metrics(y_test, ensemble_avg_probs, best_thr_avg)
@@ -907,19 +907,19 @@ auc_avg = roc_auc_score(y_test, ensemble_avg_probs)
 print(f"  Average Ensemble:")
 print(f"  F1={results_avg['F1']:.4f}  AUC={auc_avg:.4f}  "
       f"Precision={results_avg['Precision']:.4f}  Recall={results_avg['Recall']:.4f}")
-print(f"  (Your R: F1=0.489 — equal averaging diluted RF's strength)")
+print(f"  (my R: F1=0.489 — equal averaging diluted RF's strength)")
 
-# Strategy 2: Logistic stacking (same as your glm meta-learner)
+# Strategy 2: Logistic stacking (same as my glm meta-learner)
 from sklearn.linear_model import LogisticRegression as SKLogReg
 meta_X = np.column_stack([lr_probs, rf_probs, nn_probs])
 meta_model = SKLogReg(C=1.0, random_state=SEED, max_iter=200)
-meta_model.fit(meta_X, y_test)   # NOTE: same data leak as your R code — see note
+meta_model.fit(meta_X, y_test)   # NOTE: same data leak as my R code — see note
 stack_probs = meta_model.predict_proba(meta_X)[:, 1]
 best_thr_stk, _ = find_best_threshold(y_test, stack_probs)
 results_stk = get_metrics(y_test, stack_probs, best_thr_stk)
 auc_stk = roc_auc_score(y_test, stack_probs)
 
-print(f"\n  Stacked Ensemble (glm meta-learner, same as your R):")
+print(f"\n  Stacked Ensemble (glm meta-learner, same as my R):")
 print(f"  F1={results_stk['F1']:.4f}  Precision={results_stk['Precision']:.4f}  "
       f"Recall={results_stk['Recall']:.4f}")
 print(f"  Meta-learner weights: LR={meta_model.coef_[0][0]:.3f}  "
@@ -927,7 +927,7 @@ print(f"  Meta-learner weights: LR={meta_model.coef_[0][0]:.3f}  "
 print(f"  Note: high RF weight confirms it's the strongest model")
 
 # Strategy 3: RL Policy Ensemble (FLAGSHIP PI UPGRADE)
-# Replaces your glm meta-learner with REINFORCE.
+# Replaces my glm meta-learner with REINFORCE.
 # Reward = clinical utility: catching a deceased patient is worth +1,
 # but MISSING one costs -3 (3× clinical penalty, same logic you discussed).
 
@@ -936,7 +936,7 @@ print(f"  Reward: TP=+1, FP=-0.5, FN=-3 (clinical stakes weighting)")
 
 class EnsemblePolicy(nn.Module):
     """
-    Learnable ensemble that replaces your glm meta-learner.
+    Learnable ensemble that replaces my glm meta-learner.
     Takes 3 model probabilities → learns attention weights via RL.
     Maps directly to Flagship's RL + generative model approach.
     """
@@ -1004,13 +1004,13 @@ print(f"  Clinical reward optimisation shifted recall upward "
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 16  SHAP VALUES — UPGRADE FROM MEANDECREASEGINIDECREASEACCURACY
 # ─────────────────────────────────────────────────────────────────────────────
-# Your R project used MeanDecreaseGini → SEMA3B #1
+# my R project used MeanDecreaseGini → SEMA3B #1
 # SHAP gives theoretically grounded, per-patient gene attribution
 
 print("\n" + "="*60)
 print("SECTION 16: SHAP GENE IMPORTANCE (upgrade from MeanDecreaseGini)")
 print("="*60)
-print("  Your R top gene: SEMA3B (Gini=14.05), confirmed by GBM too")
+print("  my R top gene: SEMA3B (Gini=14.05), confirmed by GBM too")
 print("  SHAP upgrade: explains each individual patient's prediction")
 
 # SHAP on the winning random forest
@@ -1029,7 +1029,7 @@ else:
 if shap_vals_deceased.ndim != 2:
     shap_vals_deceased = shap_vals_deceased.reshape(100, -1)
 
-# Mean absolute SHAP → gene ranking (compare to your MeanDecreaseGini)
+# Mean absolute SHAP → gene ranking (compare to my MeanDecreaseGini)
 mean_abs_shap = np.abs(shap_vals_deceased).mean(axis=0).flatten()
 shap_df = pd.DataFrame({
     "Gene":        gene_names,
@@ -1041,7 +1041,7 @@ print(f"\n  Top 10 genes by SHAP vs MeanDecreaseGini:")
 print(shap_df[["Gene", "MeanAbsSHAP", "RF_Gini"]].head(10).to_string(index=False))
 print(f"\n  Does SEMA3B stay #1? {shap_df.iloc[0]['Gene']}")
 
-# SHAP summary plot (replaces your barplot of MeanDecreaseGini)
+# SHAP summary plot (replaces my barplot of MeanDecreaseGini)
 plt.figure(figsize=(10, 6))
 shap.summary_plot(shap_vals_deceased, X_test_u[:100],
                   feature_names=gene_names, show=False, max_display=20)
@@ -1065,7 +1065,7 @@ for idx in top5_idx:
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 17  ROC CURVES & FULL COMPARISON TABLE
 # ─────────────────────────────────────────────────────────────────────────────
-# Mirrors your R Section 15 & 16 — same ROC plot, same final comparison table
+# Mirrors my R Section 15 & 16 — same ROC plot, same final comparison table
 
 print("\n" + "="*60)
 print("SECTION 17: ROC CURVES & FINAL MODEL COMPARISON")
@@ -1099,7 +1099,7 @@ plt.savefig("roc_curves_all_models.png", dpi=120, bbox_inches="tight")
 plt.close()
 print("  Saved: roc_curves_all_models.png")
 
-# Final comparison table (same as your comparison_df sorted by F1)
+# Final comparison table (same as my comparison_df sorted by F1)
 all_results = {
     "Logistic Regression": (results_lr, auc_lr, best_thr_lr),
     "Random Forest":       (results_rf, auc_rf, best_thr_rf),
@@ -1132,7 +1132,7 @@ print(f"\n  ★ WINNER: {best_model['Model']}")
 print(f"  F1={best_model['F1']:.4f}  AUC={best_model['AUC']:.4f}  "
       f"Precision={best_model['Precision']:.4f}  Recall={best_model['Recall']:.4f}")
 
-# Side-by-side F1 and AUC bar charts (mirrors your par(mfrow=c(1,2)))
+# Side-by-side F1 and AUC bar charts (mirrors my par(mfrow=c(1,2)))
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 bar_colors = ["#D85A30" if f == final_df["F1"].max() else "#378ADD"
               for f in final_df["F1"]]
@@ -1164,7 +1164,7 @@ print("SECTION 18: CONCLUSIONS")
 print("="*60)
 
 print("""
-FROM YOUR R PROJECT:
+FROM my R PROJECT:
   ✓ Random Forest best F1=0.562, top gene SEMA3B (confirmed by GBM too)
   ✓ Logistic Regression best Recall=0.550 — caught the most deceased patients
   ✓ Stacked Ensemble achieved perfect Precision=1.000 but only Recall=0.383
@@ -1195,4 +1195,4 @@ print("  All output files saved:")
 for fname in ["eda_overview.png", "correlation_heatmap.png", "elbow_plot.png",
               "rf_feature_importance.png", "shap_summary.png",
               "roc_curves_all_models.png", "final_comparison_charts.png"]:
-    print(f"  - {fname}")
+    print(f"  - {fname}")            
