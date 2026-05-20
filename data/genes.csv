@@ -1,0 +1,7 @@
+﻿gene,uniprot_id,mean_plddt,shap_value,role
+MUC2,P98088,54.7,-0.09,biomarker
+ORM2,P19652,85.4,-0.07,biomarker
+CST1,P01037,85.1,-0.06,biomarker
+LRP1B,Q9NZR2,71.4,-0.08,tumor_suppressor
+CLEC3A,Q8IX30,81.6,-0.05,biomarker
+CASP14,P31944,84.8,-0.06,biomarker
