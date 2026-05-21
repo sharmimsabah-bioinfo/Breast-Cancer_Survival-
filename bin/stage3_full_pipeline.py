@@ -12,7 +12,7 @@ PIPELINE:
   Stage 5 (NEW)  : Agentic RL loop — self-improve design strategy
   Stage 6 (NEW)  : Biophysical simulation — MD stability check (top 5)
 
-FLAGSHIP PI CONNECTIONS:
+ CONNECTIONS:
   Flow matching  → Lipman 2022 CFM + Flagship protein design papers
   Agentic loop   → Flow-of-Options (github.com/flagshippioneering)
   RL reward      → arxiv 2410.17173 (RL on diffusion for inverse folding)
